@@ -1,22 +1,45 @@
 {
   "name": "@skew/mcp",
   "version": "0.1.0",
-  "description": "Skew MCP server — AI agents create, buy, and settle Solana options via Claude/Cursor",
+  "description": "MCP server for Skew — AI agents create, buy, and settle Solana options through Claude, Cursor, or Copilot.",
   "license": "MIT",
   "type": "module",
+  "homepage": "https://github.com/skew-labs/skew-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/skew-labs/skew-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/skew-labs/skew/issues"
+  },
+  "keywords": [
+    "solana",
+    "options",
+    "mcp",
+    "mcp-server",
+    "claude",
+    "cursor",
+    "ai-agents",
+    "skew"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "skew-mcp": "./dist/server.js"
   },
   "main": "./dist/server.js",
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc",
     "dev": "node --loader ts-node/esm src/server.ts",
     "start": "node dist/server.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.10.2",
-    "@skew/sdk": "workspace:*",
+    "@skew/sdk": "^0.1.0",
     "@coral-xyz/anchor": "^0.31.1",
     "@solana/web3.js": "^1.95.3",
     "@solana/spl-token": "^0.4.14",

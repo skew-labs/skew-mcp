@@ -165,6 +165,66 @@ async function fetchSurface(
   return (await res.json()) as SurfaceResponse;
 }
 
+// ---------------------------------------------------------------------------
+// Heuristic surface — when no live IV feed is integrated, the MCP server
+// applies a simple, transparent shape to the baseline ATM IV so the response
+// reflects the typical crypto-options surface (put-skew + short-dated
+// backwardation). Output is clearly labelled `baseline_iv_used: heuristic-*`
+// so consumers know the shape is a default, not a market quote.
+// ---------------------------------------------------------------------------
+const SMILE_SKEW_25D = -0.04; // negative = put richer (typical for crypto)
+const SMILE_CONVEXITY = 0.18; // butterfly curvature
+const TERM_POWER = 0.18; // typical short-dated premium exponent
+
+function smileIv(strike: number, spot: number, atmIv: number): number {
+  const m = Math.log(strike / spot); // log-moneyness
+  const adjusted = atmIv + SMILE_SKEW_25D * m + SMILE_CONVEXITY * m * m;
+  return Math.max(0.05, Math.min(3.0, adjusted));
+}
+
+function termIv(days: number, atm30d: number): number {
+  const ratio = Math.pow(30 / Math.max(days, 1), TERM_POWER);
+  return Math.max(0.05, Math.min(3.0, atm30d * ratio));
+}
+
+function applyHeuristicSurface(
+  raw: SurfaceResponse,
+  spot: number,
+  baselineIv: number,
+): SurfaceResponse {
+  // Replace each surface point's iv (and recompute price linearly via vega
+  // approximation is not needed — the consumer just reads `iv`/`delta`).
+  // We keep delta from the BS engine; only iv field is reshaped.
+  const surface = raw.surface.map((p) => ({
+    ...p,
+    iv: smileIv(p.strike, spot, termIv(p.expiry_days, baselineIv)),
+  }));
+
+  const term_structure = raw.term_structure.map((t) => ({
+    expiry_days: t.expiry_days,
+    atm_iv: termIv(t.expiry_days, baselineIv),
+  }));
+
+  // 25-delta risk reversal = iv(25d-call) - iv(25d-put), butterfly = (iv_put + iv_call)/2 - atm
+  // We approximate 25d strikes as ±1 stdev: spot * exp(±sigma*sqrt(t))
+  const t30 = 30 / 365;
+  const sigma = baselineIv;
+  const move = sigma * Math.sqrt(t30);
+  const k_put = spot * Math.exp(-move);
+  const k_call = spot * Math.exp(move);
+  const iv_put = smileIv(k_put, spot, baselineIv);
+  const iv_call = smileIv(k_call, spot, baselineIv);
+  const iv_atm = baselineIv;
+  const rr_25d = iv_call - iv_put;
+  const bf_25d = (iv_put + iv_call) / 2 - iv_atm;
+
+  return {
+    surface,
+    term_structure,
+    skew: { "25d_risk_reversal": rr_25d, "25d_butterfly": bf_25d },
+  };
+}
+
 function classifyVolView(termStructure: Array<{ expiry_days: number; atm_iv: number }>): {
   label: "stable" | "elevated" | "compressing" | "expanding";
   note: string;
@@ -350,20 +410,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           Math.round(spot * m),
         );
         const baselineIv = ASSET_BASELINE_IV[underlying] ?? 0.7;
-        const surface = await fetchSurface(
+        const raw = await fetchSurface(
           underlying,
           spot,
           strikes,
           [expiryDays],
           baselineIv,
         );
+        const surface = applyHeuristicSurface(raw, spot, baselineIv);
 
         const points = surface.surface
           .filter((p) => p.expiry_days === expiryDays)
           .map((p) => ({
             strike_usd: p.strike,
-            iv: p.iv,
-            delta: p.delta,
+            iv: Number(p.iv.toFixed(4)),
+            delta: Number(p.delta.toFixed(4)),
           }));
 
         const atm = points.find(
@@ -378,9 +439,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               spot_usd: spot,
               atm_iv: atm?.iv ?? baselineIv,
               points,
-              risk_reversal_25d: surface.skew["25d_risk_reversal"],
-              butterfly_25d: surface.skew["25d_butterfly"],
-              baseline_iv_used: baselineIv,
+              risk_reversal_25d: Number(surface.skew["25d_risk_reversal"].toFixed(4)),
+              butterfly_25d: Number(surface.skew["25d_butterfly"].toFixed(4)),
+              baseline_iv_used: { atm: baselineIv, source: "heuristic-smile-v1" },
               note:
                 "IV across the strike ladder for this expiry. risk_reversal_25d > 0 = call skew (calls richer than puts); < 0 = put skew.",
               disclaimer: PRICING_DISCLAIMER,
@@ -396,21 +457,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const underlying = String(a["underlying"]);
         const { price: spot } = await fetchSpot(underlying);
         const baselineIv = ASSET_BASELINE_IV[underlying] ?? 0.7;
-        const surface = await fetchSurface(
+        const raw = await fetchSurface(
           underlying,
           spot,
           [Math.round(spot)],
           TERM_LADDER_DAYS,
           baselineIv,
         );
+        const surface = applyHeuristicSurface(raw, spot, baselineIv);
 
         return ok(
           JSON.stringify(
             {
               underlying,
               spot_usd: spot,
-              term_structure: surface.term_structure,
-              baseline_iv_used: baselineIv,
+              term_structure: surface.term_structure.map((t) => ({
+                expiry_days: t.expiry_days,
+                atm_iv: Number(t.atm_iv.toFixed(4)),
+              })),
+              baseline_iv_used: { atm_30d: baselineIv, source: "heuristic-term-v1" },
               note:
                 "ATM IV across the standard expiry ladder. Compare front (7d) vs back (180d) to read the shape.",
               disclaimer: PRICING_DISCLAIMER,
@@ -427,13 +492,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { price: spot, conf } = await fetchSpot(underlying);
         const baselineIv = ASSET_BASELINE_IV[underlying] ?? 0.7;
 
-        const surface = await fetchSurface(
+        const raw = await fetchSurface(
           underlying,
           spot,
           [Math.round(spot * 0.85), Math.round(spot), Math.round(spot * 1.15)],
           [7, 30, 90],
           baselineIv,
         );
+        const surface = applyHeuristicSurface(raw, spot, baselineIv);
 
         const view = classifyVolView(surface.term_structure);
         const atm30d = surface.term_structure.find((t) => t.expiry_days === 30)
@@ -445,21 +511,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               underlying,
               spot_usd: spot,
               spot_confidence_usd: conf,
-              atm_iv_30d: atm30d,
+              atm_iv_30d: Number(atm30d.toFixed(4)),
               term_structure_summary: {
-                front_7d_atm_iv: surface.term_structure.find(
-                  (t) => t.expiry_days === 7,
-                )?.atm_iv,
-                mid_30d_atm_iv: atm30d,
-                back_90d_atm_iv: surface.term_structure.find(
-                  (t) => t.expiry_days === 90,
-                )?.atm_iv,
+                front_7d_atm_iv: Number(
+                  (surface.term_structure.find((t) => t.expiry_days === 7)
+                    ?.atm_iv ?? baselineIv).toFixed(4),
+                ),
+                mid_30d_atm_iv: Number(atm30d.toFixed(4)),
+                back_90d_atm_iv: Number(
+                  (surface.term_structure.find((t) => t.expiry_days === 90)
+                    ?.atm_iv ?? baselineIv).toFixed(4),
+                ),
               },
-              risk_reversal_25d: surface.skew["25d_risk_reversal"],
-              butterfly_25d: surface.skew["25d_butterfly"],
+              risk_reversal_25d: Number(surface.skew["25d_risk_reversal"].toFixed(4)),
+              butterfly_25d: Number(surface.skew["25d_butterfly"].toFixed(4)),
               vol_view: view.label,
               vol_view_note: view.note,
-              baseline_iv_used: baselineIv,
+              baseline_iv_used: { atm_30d: baselineIv, source: "heuristic-v1" },
               disclaimer: PRICING_DISCLAIMER,
             },
             null,

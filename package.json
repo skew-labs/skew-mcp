@@ -1,0 +1,29 @@
+{
+  "name": "@skew/mcp",
+  "version": "0.1.0",
+  "description": "Skew MCP server — AI agents create, buy, and settle Solana options via Claude/Cursor",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "skew-mcp": "./dist/server.js"
+  },
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --loader ts-node/esm src/server.ts",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "@skew/sdk": "workspace:*",
+    "@coral-xyz/anchor": "^0.31.1",
+    "@solana/web3.js": "^1.95.3",
+    "@solana/spl-token": "^0.4.14",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^20.14.0"
+  }
+}

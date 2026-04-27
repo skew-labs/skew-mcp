@@ -1,21 +1,31 @@
-# @skew/mcp — Skew MCP Server
+# @skew-labs/mcp — Skew MCP Server
 
-> **AI agents create, price, and settle Solana options on Skew via the [Model Context Protocol](https://modelcontextprotocol.io/).**
+> **AI agents create, price, settle, and analyze Solana options on Skew via the [Model Context Protocol](https://modelcontextprotocol.io/).**
 
-Drop this server into your Cursor, Claude Desktop, or Copilot config and your editor gains six tools that drive the Skew protocol end-to-end.
+Drop this server into your Cursor, Claude Desktop, or Copilot config and your editor gains nine tools that drive the Skew protocol end-to-end.
 
 ---
 
 ## Tools
 
-| Tool | Description | Wallet required |
-|---|---|---|
-| `skew_get_spot` | Live BTC/ETH/SOL/XRP/HYPE spot via Pyth Hermes | No |
-| `skew_get_fair_value` | Black-Scholes fair-value estimate from the pricing service | No |
-| `skew_list_options` | Enumerate on-chain option PDAs | No |
-| `skew_create_option` | Issue a new option + deposit USDC collateral | Yes |
-| `skew_buy_option` | Pay premium and receive the option SPL token | Yes |
-| `skew_settle_option` | Settle an expired option via Pyth | Yes |
+### Read tools (no wallet required)
+
+| Tool | Description |
+|---|---|
+| `skew_get_spot` | Live BTC/ETH/SOL/XRP/HYPE spot via Pyth Hermes |
+| `skew_get_fair_value` | Suggested fair-value premium for an option (Greeks included) |
+| `skew_list_options` | Enumerate on-chain option PDAs |
+| `skew_get_iv_smile` | IV smile across a strike ladder for one expiry, plus 25-delta risk-reversal and butterfly |
+| `skew_get_term_structure` | ATM IV across the 7d / 14d / 30d / 60d / 90d / 180d expiry ladder |
+| `skew_get_volatility_summary` | One-shot vol view: spot, ATM 30d IV, smile skew, term-structure shape, vol-view label |
+
+### Write tools (require `SKEW_PRIVATE_KEY`)
+
+| Tool | Description |
+|---|---|
+| `skew_create_option` | Issue a new option + deposit USDC collateral |
+| `skew_buy_option` | Pay premium and receive the option SPL token |
+| `skew_settle_option` | Settle an expired option via Pyth |
 
 ---
 
@@ -50,6 +60,12 @@ The model:
 4. Reports net premium and the two transaction signatures.
 
 One prompt. Two on-chain transactions. ~60 seconds.
+
+Or, just ask the agent for a market view:
+
+> **"How do you see BTC vol next week?"**
+
+The model calls `skew_get_volatility_summary` and reports the current ATM 30-day IV, smile skew, and a generic vol-view label (`stable` / `elevated` / `compressing` / `expanding`).
 
 ---
 

@@ -65,7 +65,9 @@ Or, just ask the agent for a market view:
 
 > **"How do you see BTC vol next week?"**
 
-The model calls `skew_get_volatility_summary` and reports the current ATM 30-day IV, smile skew, and a generic vol-view label (`stable` / `elevated` / `compressing` / `expanding`).
+The model calls `skew_get_volatility_summary` and reports the current ATM 30-day IV, smile skew, the 7d/30d/90d term structure, and a generic vol-view label (`stable` / `elevated` / `compressing` / `expanding`).
+
+The IV value is read directly from the on-chain volatility-state PDA when the account is initialised (`iv_source.source: "on-chain-povs"`), with a `last_update_minutes_ago` field showing freshness. On a fresh devnet deploy where the account hasn't been seeded yet, the response falls back to a per-asset heuristic surface labelled `iv_source.source: "heuristic-v1"` — same response shape, transparent about provenance.
 
 ---
 

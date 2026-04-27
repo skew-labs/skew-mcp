@@ -105,6 +105,58 @@ function err(msg: string): CallToolResult {
 const PRICING_DISCLAIMER =
   "Suggestion only. Not investment advice. The on-chain program does not read this number; settlement is governed solely by Pyth oracle data.";
 
+// ---------------------------------------------------------------------------
+// On-chain volatility state reader — selective byte-offset extraction.
+//
+// The on-chain account holds several numeric fields; this reader extracts
+// only two (the ATM-30d IV forecast and a 0..1 calm-vs-stress label) plus
+// the last update slot for staleness display. Other fields are intentionally
+// not read.
+// ---------------------------------------------------------------------------
+const POVS_STATE_SEED = Buffer.from("povs_state");
+const POVS_OFFSET_LAST_UPDATE_SLOT = 16; // 8 disc + 8 (asset+padding)
+const POVS_OFFSET_IV_MICRO = 56; // 8 disc + 48
+const POVS_OFFSET_REGIME_MICRO = 104; // 8 disc + 96
+
+const ASSET_INDEX: Record<string, number> = {
+  BTC: 0, ETH: 1, SOL: 2, XRP: 3, HYPE: 4,
+};
+
+interface PovsRead {
+  iv_30d: number;
+  regime: number; // 0..1
+  last_update_slot: bigint;
+  source: "on-chain-povs";
+}
+
+async function fetchPovsState(
+  underlying: string,
+  conn: Connection,
+): Promise<PovsRead | null> {
+  const idx = ASSET_INDEX[underlying];
+  if (idx === undefined) return null;
+  const [pda] = PublicKey.findProgramAddressSync(
+    [POVS_STATE_SEED, Buffer.from([idx])],
+    SKEW_PROGRAM_ID,
+  );
+  const acc = await conn.getAccountInfo(pda);
+  if (!acc || acc.data.length < POVS_OFFSET_REGIME_MICRO + 8) return null;
+
+  const ivMicro = acc.data.readBigUInt64LE(POVS_OFFSET_IV_MICRO);
+  const regimeMicro = acc.data.readBigUInt64LE(POVS_OFFSET_REGIME_MICRO);
+  const slot = acc.data.readBigUInt64LE(POVS_OFFSET_LAST_UPDATE_SLOT);
+
+  // If iv is 0, treat as not initialised (cold start).
+  if (ivMicro === 0n) return null;
+
+  return {
+    iv_30d: Number(ivMicro) / 1e6,
+    regime: Number(regimeMicro) / 1e6,
+    last_update_slot: slot,
+    source: "on-chain-povs",
+  };
+}
+
 async function fetchSpot(
   underlying: string,
 ): Promise<{ price: number; conf: number }> {
@@ -490,7 +542,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "skew_get_volatility_summary": {
         const underlying = String(a["underlying"]);
         const { price: spot, conf } = await fetchSpot(underlying);
-        const baselineIv = ASSET_BASELINE_IV[underlying] ?? 0.7;
+        const conn = new Connection(RPC_URL, "confirmed");
+
+        // Prefer on-chain PoVSState if initialised; fall back to heuristic.
+        const povs = await fetchPovsState(underlying, conn).catch(() => null);
+        const atm30d = povs ? povs.iv_30d : (ASSET_BASELINE_IV[underlying] ?? 0.7);
+        const baselineIv = atm30d;
 
         const raw = await fetchSurface(
           underlying,
@@ -502,8 +559,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const surface = applyHeuristicSurface(raw, spot, baselineIv);
 
         const view = classifyVolView(surface.term_structure);
-        const atm30d = surface.term_structure.find((t) => t.expiry_days === 30)
-          ?.atm_iv ?? baselineIv;
+
+        // Staleness — Solana mainnet/devnet ~400ms slots.
+        let last_update_minutes_ago: number | null = null;
+        if (povs && povs.last_update_slot > 0n) {
+          const currentSlot = await conn.getSlot();
+          const slotDelta = Number(BigInt(currentSlot) - povs.last_update_slot);
+          last_update_minutes_ago = Math.max(0, Math.round((slotDelta * 0.4) / 60));
+        }
+
+        const ivSource = povs
+          ? { atm_30d: povs.iv_30d, source: "on-chain-povs", last_update_minutes_ago }
+          : { atm_30d: baselineIv, source: "heuristic-v1" };
+
+        const regimeLabel = povs
+          ? povs.regime > 0.6
+            ? "stress"
+            : povs.regime > 0.4
+              ? "mid"
+              : "calm"
+          : null;
 
         return ok(
           JSON.stringify(
@@ -527,7 +602,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               butterfly_25d: Number(surface.skew["25d_butterfly"].toFixed(4)),
               vol_view: view.label,
               vol_view_note: view.note,
-              baseline_iv_used: { atm_30d: baselineIv, source: "heuristic-v1" },
+              regime: regimeLabel,
+              iv_source: ivSource,
               disclaimer: PRICING_DISCLAIMER,
             },
             null,

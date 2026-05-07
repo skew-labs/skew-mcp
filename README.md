@@ -2,11 +2,11 @@
 
 MCP server for Skew, the Solana OTC options clearing infrastructure.
 
-The server lets AI agents read market data, estimate pricing and margin, create
-pre-funded options, operate Auction RFQ, and inspect clearing-member state
-through the [Model Context Protocol](https://modelcontextprotocol.io/). The
-default profile is deliberately small: **23 core tools**. Wider builder and
-governance surfaces require explicit profiles.
+The server lets AI agents read market data, estimate pricing and margin, and
+inspect option, RFQ, collateral-policy, and clearing-member state through the
+[Model Context Protocol](https://modelcontextprotocol.io/). The default profile
+is deliberately read-only. Trading, RFQ, wider builder, and governance write
+surfaces require explicit profiles and a configured keypair.
 
 [![npm](https://img.shields.io/npm/v/@skew-labs/mcp?style=flat-square)](https://www.npmjs.com/package/@skew-labs/mcp)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
@@ -25,7 +25,7 @@ Skew MCP is profile-gated because agents choose tools better when the visible su
 Four retired compatibility stubs are intentionally hidden from every profile: `skew_take_best_quote`, `skew_refresh_quote`, `skew_publish_axe`, and `skew_revoke_axe`. The current on-chain IDL does not expose those instructions.
 
 What the **core profile** covers:
-- Capability discovery — supported assets, 11 payoff names, collateral rails, and trade lanes (`skew_get_capabilities`)
+- Capability discovery — supported assets, 11 payoff names, collateral rails, tenor policy, and trade lanes (`skew_get_capabilities`)
 - Market data — spot, IV smile, term structure, and volatility summary
 - Pricing + margin — fair value, one-line margin, margin breakdown, v5.1 fee estimate, and live collateral-policy reads
 - Pre-funded marketplace — list, create, buy, and settle options
@@ -59,6 +59,10 @@ The default profile is the surface most users should install first.
 describes what Skew can support; the policy PDA describes what this deployment
 currently accepts. Agents should call it before routing wSOL/jitoSOL or custom
 devnet mints.
+
+`skew_get_capabilities.tenorPolicy` is the runtime-safe expiry guide for write
+tools: live create/fill paths currently accept 1d / 7d / 14d / 28d / 90d
+buckets with ±1h tolerance. Sub-1d binaries are intentionally not enabled.
 
 ### Pre-funded marketplace
 

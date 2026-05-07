@@ -37,7 +37,19 @@ const KEYPAIR_PATH = process.env["SKEW_KEYPAIR_PATH"] ?? process.env["KEYPAIR_PA
 const USDC_MINT =
   process.env["SKEW_DEVNET_USDC_MINT"] ?? "4T2KU8PXd25XvMh6kzv3F7d55yPP6NcS7HemERBe97K8";
 const MCP_PROFILE = getSkewMcpProfile(process.env["SKEW_MCP_PROFILE"]);
-const ACTIVE_TOOLS = getSkewTools(MCP_PROFILE);
+const HAS_WRITE_KEYPAIR = Boolean(PRIVATE_KEY_B58 || KEYPAIR_PATH);
+function isReadOnlyTool(name: string): boolean {
+  if (name === "skew_get_margin") return false;
+  return (
+    name.startsWith("skew_get_") ||
+    name.startsWith("skew_fetch_") ||
+    name.startsWith("skew_list_") ||
+    name.startsWith("skew_estimate_")
+  );
+}
+const ACTIVE_TOOLS = getSkewTools(MCP_PROFILE).filter((tool) =>
+  HAS_WRITE_KEYPAIR || isReadOnlyTool(tool.name),
+);
 const ACTIVE_TOOL_NAMES = new Set(ACTIVE_TOOLS.map((tool) => tool.name));
 
 // Pyth Hermes feed IDs for spot price queries
@@ -425,7 +437,7 @@ function allowlistFairValue(input: unknown): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 // MCP Server setup
 // ---------------------------------------------------------------------------
-const server = new Server({ name: "skew", version: "0.5.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "skew", version: "0.6.2" }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: ACTIVE_TOOLS,

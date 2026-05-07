@@ -1,6 +1,6 @@
 {
   "name": "@skew-labs/mcp",
-  "version": "0.6.2",
+  "version": "0.6.4",
   "description": "MCP server for Skew — AI agents create, buy, and settle Solana options through Claude, Cursor, or Copilot.",
   "license": "MIT",
   "type": "module",
@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.10.2",
-    "@skew-labs/sdk": "^0.4.2",
+    "@skew-labs/sdk": "^0.4.6",
     "@coral-xyz/anchor": "^0.31.1",
     "@solana/web3.js": "^1.95.3",
     "@solana/spl-token": "^0.4.14",

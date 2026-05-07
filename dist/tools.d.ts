@@ -1,5 +1,5 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-export type SkewMcpProfile = "core" | "advanced" | "governance" | "all";
+export type SkewMcpProfile = "core" | "trading" | "rfq" | "advanced" | "governance" | "all";
 /**
  * MCP tool catalog for @skew-labs/mcp.
  *

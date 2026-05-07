@@ -8,25 +8,32 @@ const CORE_TOOL_ORDER = [
     "skew_get_term_structure",
     "skew_get_volatility_summary",
     "skew_get_fair_value",
-    "skew_get_margin",
     "skew_get_margin_breakdown",
     "skew_estimate_fee",
     "skew_fetch_collateral_policy",
     "skew_list_options",
+    "skew_fetch_rfq_auction",
+    "skew_fetch_clearing_member",
+];
+const TRADING_TOOL_ORDER = [
+    ...CORE_TOOL_ORDER,
     "skew_create_option",
     "skew_buy_option",
     "skew_settle_option",
+    "skew_register_clearing_member",
+    "skew_cm_add_collateral",
+];
+const RFQ_TOOL_ORDER = [
+    ...CORE_TOOL_ORDER,
     "skew_register_rfq_auction",
     "skew_register_rfq_maker",
     "skew_submit_rfq_quote",
     "skew_finalize_rfq_auction",
     "skew_cancel_rfq_auction",
-    "skew_fetch_rfq_auction",
-    "skew_register_clearing_member",
-    "skew_cm_add_collateral",
-    "skew_fetch_clearing_member",
 ];
 const CORE_TOOL_NAMES = new Set(CORE_TOOL_ORDER);
+const TRADING_TOOL_NAMES = new Set(TRADING_TOOL_ORDER);
+const RFQ_TOOL_NAMES = new Set(RFQ_TOOL_ORDER);
 const GOVERNANCE_TOOL_ORDER = [
     "skew_get_capabilities",
     "skew_list_series",
@@ -67,7 +74,7 @@ export const SKEW_TOOLS = [
     // ──────────────────────────────────────────────────────────────────────
     {
         name: "skew_create_option",
-        description: `Create a pre-funded option listing on Skew (Solana devnet). Deposits settlement-mint collateral and mints an option SPL token. Returns the option PDA address. Supported assets: ${UNDERLYING_ENUM.join(", ")}. Payoffs: ${PAYOFF_ENUM.join(", ")}. For USDC settlement, notional is USD/USDC. For wSOL/jitoSOL settlement, notional is base-token units (e.g. 0.5 = 0.5 SOL-family token). Use dry_run first when routing a non-USDC mint.`,
+        description: `Create a pre-funded option listing on Skew (Solana devnet). Deposits settlement-mint collateral and mints an option SPL token. Returns the option PDA address. Supported assets: ${UNDERLYING_ENUM.join(", ")}. Payoffs: ${PAYOFF_ENUM.join(", ")}. Expiry must land in an on-chain tenor bucket (1d, 7d, 14d, 28d, 90d) with ±1h tolerance; sub-1d binaries are not enabled in the current deployment. For USDC settlement, notional is USD/USDC. For wSOL/jitoSOL settlement, notional is base-token units (e.g. 0.5 = 0.5 SOL-family token). Use dry_run first when routing a non-USDC mint.`,
         inputSchema: {
             type: "object",
             properties: {
@@ -87,7 +94,7 @@ export const SKEW_TOOLS = [
                 },
                 expiry: {
                     type: "string",
-                    description: "Expiry in ISO 8601 UTC format (e.g. 2026-05-10T16:00:00Z)",
+                    description: "Expiry in ISO 8601 UTC format. Must match a standard on-chain tenor bucket: 1d, 7d, 14d, 28d, or 90d from now, ±1h.",
                 },
                 notional: {
                     type: "number",
@@ -529,7 +536,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_register_rfq_auction",
-        description: "Open the Auction RFQ lane for an option spec. Current RFQ v1 escrow is USDC/stable-only; buyer commits max_premium_micro and sets a 30..1200 slot competition window. Multi-MM compete via submit_rfq_quote; finalize_rfq_auction is price-discovery/event finalization, not 1-click HIT. For immediate click-to-fill, use the separate Instant RFQ relay lane (buyer_accept + cm_sign + buyer_tx_signed over RelayPayload → atomic_fill_from_relay). Phase 2 (2026-05-04) appends Inverse payoff types (asset_mask must be enabled per asset). Returns the auction PDA.",
+        description: "Open the Auction RFQ lane for an option spec. Current RFQ v1 escrow is USDC/stable-only; buyer commits max_premium_micro and sets a 30..1200 slot competition window. Multi-MM compete via submit_rfq_quote; finalize_rfq_auction is price-discovery/event finalization, not 1-click HIT. Expiry must match the standard on-chain tenor ladder (1d, 7d, 14d, 28d, 90d) within ±1h. For immediate click-to-fill, use the separate Instant RFQ relay lane (buyer_accept + cm_sign + buyer_tx_signed over RelayPayload → atomic_fill_from_relay). Phase 2 (2026-05-04) appends Inverse payoff types (asset_mask must be enabled per asset). Returns the auction PDA.",
         inputSchema: {
             type: "object",
             properties: {
@@ -549,7 +556,10 @@ export const SKEW_TOOLS = [
                     default: "USDC",
                 },
                 strike: { type: "number", description: "Strike price USD." },
-                expiry: { type: "string", description: "Expiry ISO 8601 UTC." },
+                expiry: {
+                    type: "string",
+                    description: "Expiry ISO 8601 UTC. Must match 1d, 7d, 14d, 28d, or 90d tenor from now, ±1h.",
+                },
                 notional: { type: "number", description: "Payoff cap (M) in settlement_mint units." },
                 max_premium_usd: {
                     type: "number",
@@ -1756,7 +1766,11 @@ export const SKEW_TOOLS = [
     },
 ];
 export function getSkewMcpProfile(raw) {
-    if (raw === "advanced" || raw === "governance" || raw === "all")
+    if (raw === "trading" ||
+        raw === "rfq" ||
+        raw === "advanced" ||
+        raw === "governance" ||
+        raw === "all")
         return raw;
     return "core";
 }
@@ -1768,12 +1782,20 @@ export function getSkewTools(profile) {
             return true;
         if (profile === "core")
             return CORE_TOOL_NAMES.has(tool.name);
+        if (profile === "trading")
+            return TRADING_TOOL_NAMES.has(tool.name);
+        if (profile === "rfq")
+            return RFQ_TOOL_NAMES.has(tool.name);
         if (profile === "governance")
             return GOVERNANCE_TOOL_NAMES.has(tool.name);
         return !GOVERNANCE_ONLY_TOOL_NAMES.has(tool.name);
     });
     if (profile === "core")
         return orderTools(tools, CORE_TOOL_ORDER);
+    if (profile === "trading")
+        return orderTools(tools, TRADING_TOOL_ORDER);
+    if (profile === "rfq")
+        return orderTools(tools, RFQ_TOOL_ORDER);
     if (profile === "governance")
         return orderTools(tools, GOVERNANCE_TOOL_ORDER);
     return tools;

@@ -6,7 +6,10 @@ import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { AnchorProvider, Program, Wallet } from "@coral-xyz/anchor";
 import bs58 from "bs58";
 import { createRequire } from "module";
-import { estimateFee, getSkewCapabilities, getMarginBreakdown, SkewClient, SKEW_PROGRAM_ID, } from "@skew-labs/sdk";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { estimateFee, getSkewCapabilities, getMarginBreakdown, SkewClient, SKEW_PROGRAM_ID, JITOSOL_MINT, NATIVE_SOL_MINT, } from "@skew-labs/sdk";
 import { getSkewMcpProfile, getSkewTools } from "./tools.js";
 // ---------------------------------------------------------------------------
 // Config from env
@@ -14,6 +17,7 @@ import { getSkewMcpProfile, getSkewTools } from "./tools.js";
 const RPC_URL = process.env["SKEW_RPC_URL"] ?? "https://api.devnet.solana.com";
 const PRICING_URL = process.env["SKEW_PRICING_URL"] ?? "https://skew-pricing.fly.dev";
 const PRIVATE_KEY_B58 = process.env["SKEW_PRIVATE_KEY"] ?? "";
+const KEYPAIR_PATH = process.env["SKEW_KEYPAIR_PATH"] ?? process.env["KEYPAIR_PATH"] ?? "";
 const USDC_MINT = process.env["SKEW_DEVNET_USDC_MINT"] ?? "4T2KU8PXd25XvMh6kzv3F7d55yPP6NcS7HemERBe97K8";
 const MCP_PROFILE = getSkewMcpProfile(process.env["SKEW_MCP_PROFILE"]);
 const ACTIVE_TOOLS = getSkewTools(MCP_PROFILE);
@@ -44,7 +48,7 @@ const TERM_LADDER_DAYS = [7, 14, 30, 60, 90, 180];
 const SMILE_STRIKE_MULTIPLIERS = [0.85, 0.93, 1.0, 1.07, 1.15];
 // ---------------------------------------------------------------------------
 // SkewClient — lazy init.
-// - Write tools (`create`, `buy`, `settle`) require SKEW_PRIVATE_KEY.
+// - Write tools require SKEW_KEYPAIR_PATH / KEYPAIR_PATH or SKEW_PRIVATE_KEY.
 // - Read tools (`list_options`, `get_margin`, etc.) fall back to a generated
 //   throwaway keypair so the MCP server is usable for browsing without
 //   exposing keys. The dummy wallet never signs anything.
@@ -61,14 +65,28 @@ function buildSkewClient(wallet) {
     const program = new Program(idl, provider);
     return SkewClient.fromProgram(connection, wallet, program, new PublicKey(USDC_MINT));
 }
+function expandUserPath(p) {
+    if (p === "~")
+        return os.homedir();
+    if (p.startsWith("~/"))
+        return path.join(os.homedir(), p.slice(2));
+    return p;
+}
+function loadWriteKeypair() {
+    if (PRIVATE_KEY_B58) {
+        return Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY_B58));
+    }
+    if (KEYPAIR_PATH) {
+        const raw = fs.readFileSync(expandUserPath(KEYPAIR_PATH), "utf8");
+        return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
+    }
+    throw new Error("No write key configured. Set SKEW_KEYPAIR_PATH=/path/to/devnet.json " +
+        "or SKEW_PRIVATE_KEY=<base58 secret> (KEYPAIR_PATH is also accepted).");
+}
 async function getSkewClient() {
     if (_skew)
         return _skew;
-    if (!PRIVATE_KEY_B58) {
-        throw new Error("SKEW_PRIVATE_KEY not set. Set SKEW_PRIVATE_KEY=<base58 private key> before starting the MCP server.");
-    }
-    const secretBytes = bs58.decode(PRIVATE_KEY_B58);
-    const keypair = Keypair.fromSecretKey(secretBytes);
+    const keypair = loadWriteKeypair();
     _skew = buildSkewClient(new Wallet(keypair));
     return _skew;
 }
@@ -153,6 +171,36 @@ const ASSET_INDEX = {
     XRP: 3,
     HYPE: 4,
 };
+function resolveAssetIdx(args) {
+    const rawIdx = args["assetIdx"] ?? args["asset_idx"];
+    if (rawIdx != null) {
+        const n = Number(rawIdx);
+        return Number.isInteger(n) && n >= 0 && n <= 4 ? n : null;
+    }
+    const raw = args["underlying"] ?? args["asset"];
+    if (raw == null)
+        return null;
+    const idx = ASSET_INDEX[String(raw).toUpperCase()];
+    return idx === undefined ? null : idx;
+}
+function resolveAssetSymbol(args) {
+    const idx = resolveAssetIdx(args);
+    if (idx == null)
+        return null;
+    return ["BTC", "ETH", "SOL", "XRP", "HYPE"][idx] ?? null;
+}
+function resolveSettlementMintArg(raw) {
+    if (raw == null || String(raw).trim() === "" || String(raw).toUpperCase() === "USDC") {
+        return undefined;
+    }
+    const value = String(raw).trim();
+    const upper = value.toUpperCase();
+    if (upper === "WSOL" || upper === "SOL")
+        return NATIVE_SOL_MINT;
+    if (upper === "JITOSOL" || upper === "JITO")
+        return JITOSOL_MINT;
+    return new PublicKey(value);
+}
 async function fetchPovsState(underlying, conn) {
     const idx = ASSET_INDEX[underlying];
     if (idx === undefined)
@@ -663,22 +711,60 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const unsupported = unsupportedPayoffReason(String(a["underlying"]), String(a["payoff"]));
                 if (unsupported)
                     return err(unsupported);
+                let settlementMint;
+                try {
+                    settlementMint = resolveSettlementMintArg(a["settlement_mint"]);
+                }
+                catch (e) {
+                    return err(`Invalid settlement_mint: ${String(e)}`);
+                }
                 const result = await skew.create({
                     underlying: String(a["underlying"]),
                     payoff: String(a["payoff"]),
                     strike: Number(a["strike"]),
                     expiry: String(a["expiry"]),
                     notional: Number(a["notional"]),
+                    settlementMint,
+                    dryRun: a["dry_run"] === true || a["simulate_only"] === true || a["simulate"] === true,
                     upperBound: a["upperBound"] != null ? Number(a["upperBound"]) : undefined,
                 });
+                const simulated = result.simulated === true;
                 return ok(JSON.stringify({
                     success: true,
+                    simulated,
                     option_address: result.address.toBase58(),
                     nonce: result.nonce.toString(),
+                    settlement_mint: (settlementMint ?? new PublicKey(USDC_MINT)).toBase58(),
+                    notional_unit: settlementMint == null ? "USDC/USD" : "settlement mint base units",
                     create_tx: result.createTx,
                     deposit_tx: result.depositTx,
-                    explorer_create: `https://explorer.solana.com/tx/${result.createTx}?cluster=devnet`,
-                    explorer_deposit: `https://explorer.solana.com/tx/${result.depositTx}?cluster=devnet`,
+                    simulation: result.simulation,
+                    explorer_create: simulated
+                        ? null
+                        : `https://explorer.solana.com/tx/${result.createTx}?cluster=devnet`,
+                    explorer_deposit: simulated
+                        ? null
+                        : `https://explorer.solana.com/tx/${result.depositTx}?cluster=devnet`,
+                }, null, 2));
+            }
+            case "skew_fetch_collateral_policy": {
+                const skew = await getReadOnlySkewClient();
+                const policy = await skew.fetchCollateralPolicy();
+                return ok(JSON.stringify({
+                    success: true,
+                    pda: policy.pda.toBase58(),
+                    initialized: policy.initialized,
+                    bump: policy.bump,
+                    entry_count: policy.entryCount,
+                    entries: policy.entries.map((entry) => ({
+                        mint: entry.mint.toBase58(),
+                        decimals: entry.decimals,
+                        kind_code: entry.kindCode,
+                        kind: entry.kind,
+                        oracle_feed: entry.oracleFeed.toBase58(),
+                        max_depeg_bps: entry.maxDepegBps,
+                    })),
+                    note: "This is runtime deployment state. get_capabilities reports protocol support; this allowlist decides whether a mint is accepted by live custody instructions.",
                 }, null, 2));
             }
             // -----------------------------------------------------------------------
@@ -796,14 +882,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "skew_register_conditional_order": {
                 const skew = await getSkewClient();
                 const triggerModeMap = { LastTrade: 0, PythEmaSpot: 1 };
-                const triggerDirMap = { Above: 0, Below: 1 };
+                const triggerDirMap = { Below: 0, Above: 1 };
                 const kindMap = { StopLoss: 0, TakeProfit: 1, Trailing: 2 };
-                const actionMap = {
-                    CloseIsolatedPosition: 0,
-                    EarlyExercise: 1,
-                    SellViaRfq: 2,
-                    BuybackViaRfq: 3,
-                };
+                const actionName = String(a["action"] ?? "CloseIsolatedPosition");
+                if (actionName !== "CloseIsolatedPosition") {
+                    return err("MCP conditional automation exposes only the executable CloseIsolatedPosition path. " +
+                        "SellViaRfq, EarlyExercise, and BuybackViaRfq are SDK-level fail-closed intent/state paths until direct CPI ships.");
+                }
                 const underlying = String(a["underlying"]);
                 // Pyth feed for the underlying drives the trigger oracle. Same
                 // Hermes feed id used by /surface elsewhere; resolve via the
@@ -814,7 +899,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     kind: kindMap[String(a["kind"])],
                     triggerMode: triggerModeMap[(String(a["trigger_mode"]) || "PythEmaSpot")],
                     triggerDirection: triggerDirMap[String(a["trigger_direction"])],
-                    action: actionMap[String(a["action"])],
+                    action: 2,
                     triggerOracle,
                     triggerPrice1e8: BigInt(Math.round(Number(a["trigger_price_usd"]) * 1e8)),
                     triggerGraceSlots: a["grace_slots"] != null ? Number(a["grace_slots"]) : 30,
@@ -828,7 +913,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     success: true,
                     order_pda: r.order.toBase58(),
                     tx_signature: r.txSignature,
-                    note: "Order is Active. Permissionless keeper trigger crank evaluates the Pyth oracle each slot — when condition is met past grace_slots, state flips to Triggered + ConditionalOrderTriggered event fires. Then call apply_*_action.",
+                    note: "Order is Active. Permissionless keeper trigger crank evaluates the stored Pyth oracle — when condition is met past grace_slots, state flips to Triggered + ConditionalOrderTriggered event fires. Then call skew_apply_close_isolated_action.",
                 }, null, 2));
             }
             case "skew_cancel_conditional_order": {
@@ -1060,16 +1145,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // _REPORT_2026-05-04.md D-1.
             case "skew_fetch_dvol": {
                 const skew = await getReadOnlySkewClient();
-                const idx = ASSET_INDEX[String(a["underlying"])];
-                if (idx === undefined)
-                    return err("Unknown underlying.");
+                const idx = resolveAssetIdx(a);
+                const symbol = resolveAssetSymbol(a);
+                if (idx === null || symbol === null) {
+                    return err("Unknown asset. Use underlying/asset BTC|ETH|SOL|XRP|HYPE or assetIdx 0..4.");
+                }
                 const snap = await skew.fetchDvol(idx);
                 if (snap == null)
-                    return ok(JSON.stringify({ success: true, initialised: false, note: "DvolPda not yet cranked." }, null, 2));
+                    return ok(JSON.stringify({
+                        success: true,
+                        initialized: false,
+                        initialised: false,
+                        underlying: symbol,
+                        asset_idx: idx,
+                        note: "DvolPda not yet cranked.",
+                    }, null, 2));
                 return ok(JSON.stringify({
                     success: true,
+                    initialized: true,
                     initialised: true,
-                    underlying: a["underlying"],
+                    underlying: symbol,
+                    asset_idx: idx,
                     snapshot: serializeJson(snap),
                 }, null, 2));
             }
@@ -1382,13 +1478,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "skew_register_oco_pair": {
                 const skew = await getSkewClient();
                 const buildLeg = (raw, kindCode, dirCode) => {
+                    const actionName = String(raw["action"] ?? "CloseIsolatedPosition");
+                    if (actionName !== "CloseIsolatedPosition") {
+                        throw new Error("MCP OCO automation exposes only the executable CloseIsolatedPosition path. " +
+                            "Use the SDK directly for fail-closed RFQ/exercise intent-state legs.");
+                    }
                     const u = String(raw["underlying"]);
                     return {
                         orderId: BigInt(String(raw["order_id"])),
                         kind: kindCode,
                         triggerMode: 1,
                         triggerDirection: dirCode,
-                        action: { CloseIsolatedPosition: 0, EarlyExercise: 1, SellViaRfq: 2, BuybackViaRfq: 3 }[String(raw["action"])],
+                        action: 2,
                         triggerOracle: new PublicKey(HERMES_FEED_IDS[u] ?? HERMES_FEED_IDS["BTC"]),
                         triggerPrice1e8: BigInt(Math.round(Number(raw["trigger_price_usd"]) * 1e8)),
                         triggerGraceSlots: 32,
@@ -1399,9 +1500,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         validUntilTs: BigInt(String(raw["valid_until_ts"])),
                     };
                 };
-                // Stop-loss is below (dir=1=Below); take-profit is above (dir=0=Above)
-                const sl = buildLeg(a["stop_loss"], 0, 1);
-                const tp = buildLeg(a["take_profit"], 1, 0);
+                // Stop-loss is below (dir=0=Below); take-profit is above (dir=1=Above)
+                const sl = buildLeg(a["stop_loss"], 0, 0);
+                const tp = buildLeg(a["take_profit"], 1, 1);
                 const r = await skew.registerOcoPair(sl, tp);
                 return ok(JSON.stringify({
                     success: true,
@@ -1413,15 +1514,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "skew_execute_conditional_order": {
                 const skew = await getSkewClient();
                 const authority = new PublicKey(String(a["order_authority"]));
-                // Fetch the order to recover the original triggerOracle.
-                // For now require caller-supplied; but conditional fetcher absent —
-                // resort to default Hermes BTC feed if no oracle in args. Caller can
-                // override via the explicit arg path once fetch_conditional_order ships.
-                const oracle = a["trigger_oracle"]
+                const orderId = BigInt(String(a["order_id"]));
+                const snapshot = a["trigger_oracle"] != null && a["action_target"] != null
+                    ? null
+                    : await skew.fetchConditionalOrder(authority, orderId);
+                if (!snapshot && (a["trigger_oracle"] == null || a["action_target"] == null)) {
+                    return err("ConditionalOrderPda not found. Pass both trigger_oracle and action_target, or check order_authority/order_id.");
+                }
+                const oracle = a["trigger_oracle"] != null
                     ? new PublicKey(String(a["trigger_oracle"]))
-                    : new PublicKey(HERMES_FEED_IDS["BTC"]);
-                const r = await skew.executeConditionalOrder(authority, BigInt(String(a["order_id"])), oracle);
-                return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
+                    : snapshot.triggerOracle;
+                const actionTarget = a["action_target"] != null
+                    ? new PublicKey(String(a["action_target"]))
+                    : snapshot.actionTarget;
+                const linkedOrder = a["linked_order"] != null ? new PublicKey(String(a["linked_order"])) : undefined;
+                const r = await skew.executeConditionalOrder(authority, orderId, oracle, actionTarget, linkedOrder);
+                return ok(JSON.stringify({
+                    success: true,
+                    tx_signature: r.txSignature,
+                    trigger_oracle: oracle.toBase58(),
+                    action_target: actionTarget.toBase58(),
+                    note: "Triggered orders with action=CloseIsolatedPosition can now be completed with skew_apply_close_isolated_action.",
+                }, null, 2));
             }
             case "skew_cleanup_expired_conditional_order": {
                 const skew = await getSkewClient();

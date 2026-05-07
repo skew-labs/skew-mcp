@@ -11,6 +11,7 @@ const CORE_TOOL_ORDER = [
     "skew_get_margin",
     "skew_get_margin_breakdown",
     "skew_estimate_fee",
+    "skew_fetch_collateral_policy",
     "skew_list_options",
     "skew_create_option",
     "skew_buy_option",
@@ -66,7 +67,7 @@ export const SKEW_TOOLS = [
     // ──────────────────────────────────────────────────────────────────────
     {
         name: "skew_create_option",
-        description: `Create a pre-funded option listing on Skew (Solana devnet). Deposits USDC collateral and mints an option SPL token. Returns the option PDA address. Supported assets: ${UNDERLYING_ENUM.join(", ")}. Payoffs: ${PAYOFF_ENUM.join(", ")}.`,
+        description: `Create a pre-funded option listing on Skew (Solana devnet). Deposits settlement-mint collateral and mints an option SPL token. Returns the option PDA address. Supported assets: ${UNDERLYING_ENUM.join(", ")}. Payoffs: ${PAYOFF_ENUM.join(", ")}. For USDC settlement, notional is USD/USDC. For wSOL/jitoSOL settlement, notional is base-token units (e.g. 0.5 = 0.5 SOL-family token). Use dry_run first when routing a non-USDC mint.`,
         inputSchema: {
             type: "object",
             properties: {
@@ -90,7 +91,23 @@ export const SKEW_TOOLS = [
                 },
                 notional: {
                     type: "number",
-                    description: "Max payoff in USDC (e.g. 1000 for $1,000)",
+                    description: "Max payoff in settlement units. USDC: USD/USDC amount. wSOL/jitoSOL: base token amount.",
+                },
+                settlement_mint: {
+                    type: "string",
+                    description: "Optional: USDC, wSOL, jitoSOL, or a base58 mint registered in CollateralPolicyPda. Defaults to USDC.",
+                },
+                dry_run: {
+                    type: "boolean",
+                    description: "If true, simulate create+deposit and return logs/CU without sending.",
+                },
+                simulate_only: {
+                    type: "boolean",
+                    description: "Alias for dry_run.",
+                },
+                simulate: {
+                    type: "boolean",
+                    description: "Alias for dry_run.",
                 },
                 upperBound: {
                     type: "number",
@@ -117,6 +134,11 @@ export const SKEW_TOOLS = [
             },
             required: ["option_address", "premium_usd"],
         },
+    },
+    {
+        name: "skew_fetch_collateral_policy",
+        description: "Read the live CollateralPolicyPda mint allowlist for this deployment. Capabilities show protocol support; this tool shows which USDC/wSOL/jitoSOL/custom mints are actually registered now, so agents can preflight before sending write transactions.",
+        inputSchema: { type: "object", properties: {} },
     },
     {
         name: "skew_settle_option",
@@ -559,7 +581,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_register_conditional_order",
-        description: "Register a stop-loss / take-profit / OCO conditional order gated on Pyth EMA. Permissionless keeper triggers via execute_conditional_order when oracle crosses. Then the user fires apply_*_action (close_isolated, sell_via_rfq, buyback_via_rfq, early_exercise) to perform the settlement. Phase 1633.D Drift v2 trigger pattern.",
+        description: "Register an executable stop-loss / take-profit conditional order gated on Pyth EMA. MCP intentionally exposes only action=CloseIsolatedPosition because it is the only conditional action that performs a real on-chain CPI today. SellViaRfq, EarlyExercise, and BuybackViaRfq remain SDK-level fail-closed intent/state paths until direct CPI ships.",
         inputSchema: {
             type: "object",
             properties: {
@@ -574,10 +596,15 @@ export const SKEW_TOOLS = [
                     enum: ["LastTrade", "PythEmaSpot"],
                     description: "Default PythEmaSpot — most robust against MEV.",
                 },
-                trigger_direction: { type: "string", enum: ["Above", "Below"] },
+                trigger_direction: {
+                    type: "string",
+                    enum: ["Above", "Below"],
+                    description: "Maps to on-chain direction code: Below=0, Above=1.",
+                },
                 action: {
                     type: "string",
-                    enum: ["CloseIsolatedPosition", "EarlyExercise", "SellViaRfq", "BuybackViaRfq"],
+                    enum: ["CloseIsolatedPosition"],
+                    description: "Only executable MCP action. Other conditional action types are SDK-only fail-closed intents.",
                 },
                 underlying: { type: "string", enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"] },
                 trigger_price_usd: { type: "number", description: "Pyth scale auto-converted to 1e8." },
@@ -668,11 +695,35 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_fetch_dvol",
-        description: "Read on-chain DvolPda for an asset — 28d / 90d DVOL variance index + realized variance. Used by combo_v2 quoting + variance-swap replication.",
+        description: "Read on-chain DvolPda for an asset — 28d / 90d DVOL variance index + realized variance. Accepts the same asset forms as other market-data tools: underlying/asset symbol (BTC, ETH, SOL, XRP, HYPE) or assetIdx/asset_idx 0..4.",
         inputSchema: {
             type: "object",
-            properties: { underlying: { type: "string", enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"] } },
-            required: ["underlying"],
+            properties: {
+                underlying: { type: "string", enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"] },
+                asset: {
+                    type: "string",
+                    enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"],
+                    description: "Alias for underlying; case-insensitive.",
+                },
+                assetIdx: {
+                    type: "integer",
+                    minimum: 0,
+                    maximum: 4,
+                    description: "Numeric asset enum: BTC=0, ETH=1, SOL=2, XRP=3, HYPE=4.",
+                },
+                asset_idx: {
+                    type: "integer",
+                    minimum: 0,
+                    maximum: 4,
+                    description: "Snake-case alias for assetIdx.",
+                },
+            },
+            anyOf: [
+                { required: ["underlying"] },
+                { required: ["asset"] },
+                { required: ["assetIdx"] },
+                { required: ["asset_idx"] },
+            ],
         },
     },
     {
@@ -1120,7 +1171,8 @@ export const SKEW_TOOLS = [
                         trigger_price_usd: { type: "number" },
                         action: {
                             type: "string",
-                            enum: ["CloseIsolatedPosition", "EarlyExercise", "SellViaRfq", "BuybackViaRfq"],
+                            enum: ["CloseIsolatedPosition"],
+                            description: "Only executable MCP action.",
                         },
                         action_target: { type: "string" },
                         valid_until_ts: { type: "string" },
@@ -1142,7 +1194,8 @@ export const SKEW_TOOLS = [
                         trigger_price_usd: { type: "number" },
                         action: {
                             type: "string",
-                            enum: ["CloseIsolatedPosition", "EarlyExercise", "SellViaRfq", "BuybackViaRfq"],
+                            enum: ["CloseIsolatedPosition"],
+                            description: "Only executable MCP action.",
                         },
                         action_target: { type: "string" },
                         valid_until_ts: { type: "string" },
@@ -1162,12 +1215,24 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_execute_conditional_order",
-        description: "Permissionless keeper trigger — flips an Active conditional order's status to Triggered when the Pyth EMA crosses past grace_slots. Then user calls apply_*_action.",
+        description: "Permissionless keeper trigger — reads the stored ConditionalOrderPda, checks its Pyth EMA oracle, and flips Active -> Triggered when the crossing holds past grace_slots. Then call skew_apply_close_isolated_action for executable CloseIsolatedPosition orders.",
         inputSchema: {
             type: "object",
             properties: {
                 order_authority: { type: "string", description: "Original order owner pubkey." },
                 order_id: { type: "string", description: "u64 nonce as bigint string." },
+                trigger_oracle: {
+                    type: "string",
+                    description: "Optional Pyth oracle account override. If omitted, MCP reads it from ConditionalOrderPda.",
+                },
+                action_target: {
+                    type: "string",
+                    description: "Optional option PDA override. If omitted, MCP reads it from ConditionalOrderPda.",
+                },
+                linked_order: {
+                    type: "string",
+                    description: "Optional linked OCO partner order PDA.",
+                },
             },
             required: ["order_authority", "order_id"],
         },

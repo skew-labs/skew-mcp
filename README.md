@@ -5,7 +5,7 @@ MCP server for Skew, the Solana OTC options clearing infrastructure.
 The server lets AI agents read market data, estimate pricing and margin, create
 pre-funded options, operate Auction RFQ, and inspect clearing-member state
 through the [Model Context Protocol](https://modelcontextprotocol.io/). The
-default profile is deliberately small: **22 core tools**. Wider builder and
+default profile is deliberately small: **23 core tools**. Wider builder and
 governance surfaces require explicit profiles.
 
 [![npm](https://img.shields.io/npm/v/@skew-labs/mcp?style=flat-square)](https://www.npmjs.com/package/@skew-labs/mcp)
@@ -17,17 +17,17 @@ Skew MCP is profile-gated because agents choose tools better when the visible su
 
 | Profile | Set with `SKEW_MCP_PROFILE` | Visible tools | Intended user |
 |---|---:|---:|---|
-| `core` | default | 22 | First-time builders, desks, and evaluation sessions |
-| `advanced` | `advanced` | 88 | Builders operating conditional, combo, vault, builder, series, and snapshot workflows |
+| `core` | default | 23 | First-time builders, desks, and evaluation sessions |
+| `advanced` | `advanced` | 89 | Builders operating conditional, combo, vault, builder, series, and snapshot workflows |
 | `governance` | `governance` | 8 | Explicit admin/governance sessions only |
-| `all` | `all` | 93 | Internal development and audit checks |
+| `all` | `all` | 94 | Internal development and audit checks |
 
 Four retired compatibility stubs are intentionally hidden from every profile: `skew_take_best_quote`, `skew_refresh_quote`, `skew_publish_axe`, and `skew_revoke_axe`. The current on-chain IDL does not expose those instructions.
 
 What the **core profile** covers:
 - Capability discovery — supported assets, 11 payoff names, collateral rails, and trade lanes (`skew_get_capabilities`)
 - Market data — spot, IV smile, term structure, and volatility summary
-- Pricing + margin — fair value, one-line margin, margin breakdown, and v5.1 fee estimate
+- Pricing + margin — fair value, one-line margin, margin breakdown, v5.1 fee estimate, and live collateral-policy reads
 - Pre-funded marketplace — list, create, buy, and settle options
 - Auction RFQ — register RFQ, register maker, submit quote, finalize, cancel, and fetch RFQ account state
 - Clearing member basics — register CM, add collateral, fetch CM account state
@@ -39,7 +39,7 @@ If you need any of those, hit `@skew-labs/sdk` directly — see the `Methods` ta
 
 ---
 
-## Core Tools (22)
+## Core Tools (23)
 
 The default profile is the surface most users should install first.
 
@@ -53,7 +53,12 @@ The default profile is the surface most users should install first.
 
 ### Pricing and margin
 
-`skew_get_fair_value`, `skew_get_margin`, `skew_get_margin_breakdown`, `skew_estimate_fee`.
+`skew_get_fair_value`, `skew_get_margin`, `skew_get_margin_breakdown`, `skew_estimate_fee`, `skew_fetch_collateral_policy`.
+
+`skew_fetch_collateral_policy` is the runtime mint allowlist. `skew_get_capabilities`
+describes what Skew can support; the policy PDA describes what this deployment
+currently accepts. Agents should call it before routing wSOL/jitoSOL or custom
+devnet mints.
 
 ### Pre-funded marketplace
 
@@ -75,6 +80,27 @@ Use `SKEW_MCP_PROFILE=advanced` when you intentionally want the wider builder su
 
 Use `SKEW_MCP_PROFILE=governance` for explicit admin sessions. This profile is intentionally small and separate from normal builder workflows.
 
+For volatility snapshots, `skew_fetch_dvol` accepts the same asset selectors
+agents use elsewhere: `underlying` or `asset` as `BTC|ETH|SOL|XRP|HYPE`, or
+`assetIdx` / `asset_idx` as `0..4`.
+
+### Conditional / SL+TP execution posture
+
+The MCP conditional surface is deliberately executable-only. It exposes
+`CloseIsolatedPosition` for SL/TP/OCO because that path performs the live
+on-chain CPI: `register_conditional_order -> execute_conditional_order ->
+apply_close_isolated_action`.
+
+`SellViaRfq`, `EarlyExercise`, and `BuybackViaRfq` remain SDK-level
+fail-closed intent/state paths until their direct CPI routes ship. MCP rejects
+those actions instead of making an agent demo look executable when no fill is
+sent.
+
+For keeper demos, `skew_execute_conditional_order` reads the stored
+`ConditionalOrderPda` to recover the original Pyth oracle and action target.
+You can still pass `trigger_oracle` and `action_target` explicitly for
+stateless cranks.
+
 ---
 
 ## Cursor — quick install
@@ -90,7 +116,7 @@ Add to your `.cursor/mcp.json` (project-level) or Cursor Settings → MCP (globa
       "env": {
         "SKEW_MCP_PROFILE": "core",
         "SKEW_RPC_URL": "https://api.devnet.solana.com",
-        "SKEW_PRIVATE_KEY": "<base58 devnet key — devnet only>",
+        "SKEW_KEYPAIR_PATH": "~/.config/solana/devnet.json",
         "SKEW_DEVNET_USDC_MINT": "4T2KU8PXd25XvMh6kzv3F7d55yPP6NcS7HemERBe97K8"
       }
     }
@@ -119,6 +145,15 @@ The model calls `skew_get_volatility_summary` and reports the current ATM 30-day
 
 The IV value is read directly from the on-chain `PoVSState` PDA when the account is initialised (`iv_source.source: "on-chain-povs"`), with a `last_update_minutes_ago` field showing freshness. On a fresh devnet deploy where the account hasn't been seeded yet, the response falls back to a per-asset heuristic surface labelled `iv_source.source: "heuristic-v1"` — same response shape, transparent about provenance. Settlement remains Pyth-only; MCP volatility tools are advisory reads.
 
+Write tools also accept simulation-first flows where exposed. For example,
+`skew_create_option` supports `dry_run: true`, `simulate: true`, or
+`simulate_only: true`; it
+returns the combined create+deposit simulation logs and compute units without
+sending a transaction.
+
+MCP transports JSON as `content[0].text`. Tool responses are deliberately valid
+JSON strings so agents can `JSON.parse` once and continue with typed fields.
+
 ---
 
 ## Claude Desktop
@@ -134,7 +169,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
       "env": {
         "SKEW_MCP_PROFILE": "core",
         "SKEW_RPC_URL": "https://api.devnet.solana.com",
-        "SKEW_PRIVATE_KEY": "<base58 devnet key — devnet only>"
+        "SKEW_KEYPAIR_PATH": "~/.config/solana/devnet.json"
       }
     }
   }
@@ -149,13 +184,22 @@ Restart Claude Desktop. The Skew tools appear in the tool picker.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `SKEW_PRIVATE_KEY` | For write tools | — | Base58 wallet key (devnet only — see warning below) |
+| `SKEW_KEYPAIR_PATH` / `KEYPAIR_PATH` | For write tools | — | Path to a Solana keypair JSON, e.g. `~/.config/solana/devnet.json`. Preferred for local devnet sessions |
+| `SKEW_PRIVATE_KEY` | For write tools | — | Base58-encoded Solana secret key. Use only for isolated devnet keys; if both write-key envs are set, this takes precedence |
 | `SKEW_MCP_PROFILE` | No | `core` | Tool surface: `core`, `advanced`, `governance`, or `all` |
 | `SKEW_RPC_URL` | No | `https://api.devnet.solana.com` | Solana RPC endpoint |
 | `SKEW_PRICING_URL` | No | `https://skew-pricing.fly.dev` | Fair-value HTTP API |
 | `SKEW_DEVNET_USDC_MINT` | No | `4T2KU8...K8` | Devnet USDC mint |
 
 > **Devnet only.** Never paste a mainnet private key. The MCP server runs on your machine — your editor sees the key. Use a fresh devnet keypair.
+
+For lower cold-start latency in demos, install the binary once and point the
+editor at `skew-mcp` instead of spawning `npx` each session:
+
+```bash
+npm i -g @skew-labs/mcp
+skew-mcp
+```
 
 ---
 
@@ -173,7 +217,7 @@ pnpm run build
 ## Operating Posture
 
 MCP is an agent interface, not a custody workaround. Write tools require
-`SKEW_PRIVATE_KEY`, and the server runs locally in the user's editor process.
+`SKEW_KEYPAIR_PATH` or `SKEW_PRIVATE_KEY`, and the server runs locally in the user's editor process.
 Use devnet keys by default. For production integrations, prefer wallet-mediated
 SDK flows or a dedicated signing service with explicit policy checks.
 

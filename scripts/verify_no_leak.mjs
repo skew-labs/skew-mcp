@@ -12,49 +12,35 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = join(__dirname, "..");
 
-// Inline list — keep in sync with src/__forbidden_terms.ts. We do not
-// import the TS file here to keep the verifier dependency-free; both files
-// share the same source-of-truth content.
+// Inline list — academic estimator framework names + internal references.
+// Kept in sync with src/__forbidden_terms.ts. We do not import the TS file
+// here to keep the verifier dependency-free.
+//
+// NOT in this list (per user explicit authorisation
+// "yes to weakening verify_no_leak.mjs", 2026-05-03):
+//   - PoVS / Hamilton / DVOL / ICC field names (sigma_t_micro, vrp_rel,
+//     var_99, es_999, theta_d, sigma_inf, xi_micro, beta_micro, kappa,
+//     theta_long_term, p_max_micro, regime_indicator_micro, returns_buf,
+//     iv_history, iv_idx, sigma_inf_window, synth_iv, VRP) — published
+//     in the IDL field section and the architecture docs page.
+//   - On-chain account / state names: "Hamilton" (HamiltonState account
+//     published in IDL), "Heston" (well-known stochastic-vol model —
+//     neutral textbook reference), "AR(1)" / "EWMA" (textbook, not
+//     framework-specific).
+//   - Protocol release tags ("Phase 1633.G" etc.) — release versioning.
 const FORBIDDEN = [
   "POT-GPD",
-  "Hamilton",
   "Yang-Zhang",
   "Yang–Zhang",
   "RiskMetrics",
-  "EWMA",
   "GARCH",
-  "Heston",
-  "AR(1)",
-  "VRP",
-  "vrp_rel",
-  "VaR_99",
-  "ES_99",
-  "es_999",
-  "var_99",
-  "xi_micro",
-  "beta_micro",
-  "kappa",
-  "theta_d",
-  "theta_long_term",
-  "sigma_inf",
-  "sigma_t_micro",
-  "p_max_micro",
-  "regime_indicator_micro",
-  "returns_buf",
-  "iv_history",
-  "iv_idx",
-  "sigma_inf_window",
-  "synth_iv",
-  "Phase 1",
-  "phase_1",
+  "Hansen-Lunde",
+  "Hansen–Lunde",
   "master paper",
   "spec §",
   "AGENT-PROTOCOL",
   "Iron Law",
-  "Article 7",
   "DISPROVEN",
-  "Hansen-Lunde",
-  "Hansen–Lunde",
 ];
 
 // Dirs we audit. dist/ is the npm-published artifact; src/ is the source

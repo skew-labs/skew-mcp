@@ -3,6 +3,7 @@ const UNDERLYING_ENUM = [...SKEW_UNDERLYINGS];
 const PAYOFF_ENUM = [...SKEW_PAYOFF_TYPES];
 const CORE_TOOL_ORDER = [
     "skew_get_capabilities",
+    "skew_get_signer_info",
     "skew_get_spot",
     "skew_get_iv_smile",
     "skew_get_term_structure",
@@ -11,23 +12,69 @@ const CORE_TOOL_ORDER = [
     "skew_get_margin_breakdown",
     "skew_estimate_fee",
     "skew_fetch_collateral_policy",
+    "skew_fetch_pm_cache",
+    "skew_preview_incremental_margin",
+    "skew_list_rent_reclaimable",
     "skew_list_options",
+    "skew_fetch_portfolio",
+    "skew_list_rfq_auctions",
+    "skew_list_secondary_listings",
     "skew_fetch_rfq_auction",
+    "skew_list_rfq_quotes",
     "skew_fetch_clearing_member",
 ];
 const TRADING_TOOL_ORDER = [
     ...CORE_TOOL_ORDER,
+    "skew_get_margin",
+    "skew_request_instant_rfq_quotes",
+    "skew_request_instant_rfq_from_auction",
+    "skew_hit_instant_rfq_quote",
+    "skew_hit_instant_rfq_from_auction_quote",
+    "skew_serve_instant_rfq_mm_once",
     "skew_create_option",
+    "skew_create_option_from_rfq_quote",
+    "skew_buy_option_from_rfq_quote",
     "skew_buy_option",
+    "skew_create_secondary_listing",
+    "skew_buy_secondary_listing",
+    "skew_transfer_option",
+    "skew_track_held_position",
+    "skew_untrack_held_position",
+    "skew_rebalance_pm_lock",
     "skew_settle_option",
+    "skew_liquidate_option",
     "skew_register_clearing_member",
     "skew_cm_add_collateral",
+    "skew_init_volume_tracker",
+    "skew_refresh_pm_cache_full",
+    "skew_prepare_rent_reclaim_batch",
 ];
 const RFQ_TOOL_ORDER = [
     ...CORE_TOOL_ORDER,
+    "skew_request_instant_rfq_quotes",
+    "skew_request_instant_rfq_from_auction",
+    "skew_hit_instant_rfq_quote",
+    "skew_hit_instant_rfq_from_auction_quote",
+    "skew_serve_instant_rfq_mm_once",
     "skew_register_rfq_auction",
     "skew_register_rfq_maker",
+    "skew_init_volume_tracker",
+    "skew_create_option_from_rfq_quote",
+    "skew_buy_option_from_rfq_quote",
+    "skew_buy_option",
+    "skew_create_secondary_listing",
+    "skew_buy_secondary_listing",
+    "skew_transfer_option",
+    "skew_track_held_position",
+    "skew_untrack_held_position",
+    "skew_rebalance_pm_lock",
+    "skew_liquidate_option",
+    "skew_submit_rfq_quote_direct",
     "skew_submit_rfq_quote",
+    "skew_refresh_quote",
+    "skew_publish_axe",
+    "skew_update_axe",
+    "skew_revoke_axe",
     "skew_finalize_rfq_auction",
     "skew_cancel_rfq_auction",
 ];
@@ -52,12 +99,30 @@ const GOVERNANCE_ONLY_TOOL_NAMES = new Set([
     "skew_delist_series",
     "skew_governance_set_series_max_oi",
 ]);
-const DEPRECATED_TOOL_NAMES = new Set([
-    "skew_take_best_quote",
-    "skew_refresh_quote",
-    "skew_publish_axe",
-    "skew_revoke_axe",
+const DISABLED_TOOL_REASONS = {
+    skew_apply_early_exercise_action: "On-chain early-exercise automation is disabled until the direct exercise CPI ships. This MCP tool is hidden and stale calls fail closed instead of emitting a state-only event.",
+    skew_apply_sell_via_rfq_action: "On-chain sell-via-RFQ automation is disabled until the direct RFQ CPI ships. Use the normal Auction RFQ flow instead.",
+    skew_apply_buyback_via_rfq_action: "On-chain buyback-via-RFQ automation is disabled until the direct RFQ CPI ships. Use the normal Auction RFQ flow instead.",
+    skew_take_best_quote: "Auction RFQ take_best_quote is hidden at launch because it does not complete option mint/close semantics. Use finalize_rfq_auction for firm tape/refund and Instant RFQ atomic_fill_from_relay for cleared execution.",
+};
+const DISABLED_TOOL_NAMES = new Set(Object.keys(DISABLED_TOOL_REASONS));
+const DEPRECATED_TOOL_NAMES = new Set([...DISABLED_TOOL_NAMES]);
+const READ_PREFIX_WRITE_EXCEPTIONS = new Set([
+    "skew_get_margin",
+    "skew_list_series",
 ]);
+export function getSkewDisabledToolReason(name) {
+    return DISABLED_TOOL_REASONS[name] ?? null;
+}
+export function isSkewReadOnlyTool(name) {
+    if (READ_PREFIX_WRITE_EXCEPTIONS.has(name))
+        return false;
+    return (name.startsWith("skew_get_") ||
+        name.startsWith("skew_fetch_") ||
+        name.startsWith("skew_list_") ||
+        name.startsWith("skew_preview_") ||
+        name.startsWith("skew_estimate_"));
+}
 /**
  * MCP tool catalog for @skew-labs/mcp.
  *
@@ -126,7 +191,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_buy_option",
-        description: "Buy an existing option on Skew devnet. Pays premium from buyer's USDC ATA to the creator. Returns the transaction signature.",
+        description: "Buy an existing option on Skew devnet. Pays premium from buyer's USDC ATA to the creator. For Auction RFQ execution, prefer skew_buy_option_from_rfq_quote so the buyer action is bound to the best firm quote.",
         inputSchema: {
             type: "object",
             properties: {
@@ -143,9 +208,387 @@ export const SKEW_TOOLS = [
         },
     },
     {
+        name: "skew_create_option_from_rfq_quote",
+        description: "Issuer/MM execution bridge for USDC Auction RFQs: read the current best firm quote, verify the configured wallet is that best-quote maker, then create and collateralize a real pre-funded OptionAccount with the same auction terms. Supports Vanilla, Digital, CappedVanilla, and RangeAccrual. The buyer should then call skew_buy_option_from_rfq_quote with the auction and option_address so the purchase is bound to the firm quote. This is real issuance; it does not pretend finalize_rfq_auction mints an option. Inverse physical RFQs route through the Instant RFQ / atomic-fill lane.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                auction: {
+                    type: "string",
+                    description: "Auction RFQ PDA base58.",
+                },
+                allow_expired_quote: {
+                    type: "boolean",
+                    description: "Default false. If false, rejects when the best quote's valid_until_slot has passed.",
+                },
+                require_best_quote_for_maker: {
+                    type: "boolean",
+                    description: "Default true. If true, the configured MCP wallet must equal auction.best_quote_mm.",
+                },
+                dry_run: {
+                    type: "boolean",
+                    description: "If true, simulate create+deposit and return logs/CU without sending transactions.",
+                },
+            },
+            required: ["auction"],
+        },
+    },
+    {
+        name: "skew_buy_option_from_rfq_quote",
+        description: "Buyer-side Auction RFQ execution guard. Refetches the RFQ auction, verifies the configured wallet is the auction buyer, verifies the funded option matches the current best firm quote maker and auction terms, then calls buy_option with the exact best-quote premium. Use this instead of raw skew_buy_option for RFQ tape executions.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                auction: {
+                    type: "string",
+                    description: "Auction RFQ PDA base58.",
+                },
+                option_address: {
+                    type: "string",
+                    description: "Funded OptionAccount PDA returned by skew_create_option_from_rfq_quote.",
+                },
+                allow_expired_quote: {
+                    type: "boolean",
+                    description: "Default false. If false, rejects when the best quote's valid_until_slot has passed.",
+                },
+            },
+            required: ["auction", "option_address"],
+        },
+    },
+    {
+        name: "skew_request_instant_rfq_quotes",
+        description: "Buyer-side Instant RFQ quote request. Broadcasts a relay-backed RFQ using the configured wallet as buyer and returns relay_nonce plus live CM/MM quote acknowledgements. This is the PM/CM atomic-fill lane; use skew_hit_instant_rfq_quote to execute one returned quote.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                underlying: {
+                    type: "string",
+                    enum: UNDERLYING_ENUM,
+                    description: "Underlying asset.",
+                },
+                payoff: {
+                    type: "string",
+                    enum: PAYOFF_ENUM,
+                    description: "Payoff type. Linear USDC Instant RFQs use non-inverse payoffs; SOL-family physical rails use inverse payoffs.",
+                },
+                strike: {
+                    type: "number",
+                    description: "Strike price in USD.",
+                },
+                expiry: {
+                    type: "string",
+                    description: "Expiry in ISO 8601 UTC format. Must satisfy the deployed tenor bucket policy.",
+                },
+                notional: {
+                    type: "number",
+                    description: "USDC lane payoff/notional in USD. For physical inverse lanes this is settlement base-unit amount.",
+                },
+                max_premium_usd: {
+                    type: "number",
+                    description: "Optional buyer premium cap in USD for tape/readback display. The selected quote still passes as premium_usd or premium_micro to skew_hit_instant_rfq_quote.",
+                },
+                upper_bound_usd: {
+                    type: "number",
+                    description: "Required for range_accrual; cap strike for capped_* when applicable.",
+                },
+                settlement_mint: {
+                    type: "string",
+                    description: "USDC, wSOL, jitoSOL, or a mint pubkey. Defaults to USDC.",
+                },
+                timeout_ms: {
+                    type: "integer",
+                    minimum: 500,
+                    maximum: 600000,
+                    description: "How long to collect quote_ack messages before returning. Defaults to 60000; max 10 minutes for demo desks and human approval flows.",
+                },
+                max_quotes: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 25,
+                    description: "Return early after this many quotes.",
+                },
+                required_cm_pubkey: {
+                    type: "string",
+                    description: "Optional maker/CM pubkey filter. When set, only quote_ack messages from this CM are returned and the hit template is pinned to that CM.",
+                },
+                relay_url: {
+                    type: "string",
+                    description: "Optional relay WebSocket URL. Defaults to the Skew devnet relay.",
+                },
+            },
+            required: ["underlying", "payoff", "strike", "expiry", "notional"],
+        },
+    },
+    {
+        name: "skew_request_instant_rfq_from_auction",
+        description: "Buyer-side PM-backed execution bridge for an Auction RFQ. Refetches the Auction RFQ PDA, derives the exact Instant RFQ terms, broadcasts them to the relay, and returns live quote_ack responses plus a hit template. This does not use the pre-funded 100% collateral bridge; final issuance happens only through skew_hit_instant_rfq_from_auction_quote / atomic_fill_from_relay.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                auction: {
+                    type: "string",
+                    description: "Auction RFQ PDA base58. The configured MCP wallet must be this auction's buyer.",
+                },
+                max_premium_micro: {
+                    type: "string",
+                    description: "Optional override for Instant RFQ premium cap in USDC micro-units. Defaults to the auction best quote premium when present, otherwise auction max premium.",
+                },
+                settlement_mint: {
+                    type: "string",
+                    description: "Optional settlement mint override. Defaults to USDC for non-inverse Auction RFQs.",
+                },
+                timeout_ms: {
+                    type: "integer",
+                    minimum: 500,
+                    maximum: 600000,
+                    description: "How long to collect quote_ack messages before returning. Defaults to 60000; max 10 minutes for demo desks and human approval flows.",
+                },
+                max_quotes: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 25,
+                    description: "Return early after this many quotes.",
+                },
+                required_cm_pubkey: {
+                    type: "string",
+                    description: "Optional maker/CM pubkey filter. When set, only quote_ack messages from this CM are returned and the hit template is pinned to that CM.",
+                },
+                relay_url: {
+                    type: "string",
+                    description: "Optional relay WebSocket URL. Defaults to the Skew devnet relay.",
+                },
+            },
+            required: ["auction"],
+        },
+    },
+    {
+        name: "skew_hit_instant_rfq_quote",
+        description: "Execute a selected Instant RFQ quote through atomic_fill_from_relay. The configured buyer wallet signs only the relay-prepared Solana transaction. Provide premium_micro or premium_usd; premium_micro is preferred when copied from quote_ack. Returns tx, option PDA, PM risk preflight, option readback, and buyer/maker portfolio counts.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                relay_nonce: {
+                    type: "string",
+                    description: "relay_nonce returned by skew_request_instant_rfq_quotes.",
+                },
+                cm_pubkey: {
+                    type: "string",
+                    description: "CM/MM authority pubkey from a quote_ack.",
+                },
+                premium_micro: {
+                    type: "string",
+                    description: "Selected premium in USDC micro-units, usually copied from the quote_ack. Required unless premium_usd is supplied.",
+                },
+                premium_usd: {
+                    type: "number",
+                    description: "Alternative selected premium in USD. Required only when premium_micro is omitted.",
+                },
+                underlying: {
+                    type: "string",
+                    enum: UNDERLYING_ENUM,
+                    description: "Underlying asset. Must match the quote request.",
+                },
+                payoff: {
+                    type: "string",
+                    enum: PAYOFF_ENUM,
+                    description: "Payoff type. Must match the quote request.",
+                },
+                strike: {
+                    type: "number",
+                    description: "Strike price in USD. Must match the quote request.",
+                },
+                expiry: {
+                    type: "string",
+                    description: "Expiry ISO string. Must match the quote request.",
+                },
+                notional: {
+                    type: "number",
+                    description: "Payoff/notional amount. Must match the quote request.",
+                },
+                upper_bound_usd: {
+                    type: "number",
+                    description: "Range upper bound or capped strike when applicable. Must match the quote request.",
+                },
+                settlement_mint: {
+                    type: "string",
+                    description: "USDC, wSOL, jitoSOL, or a mint pubkey. Defaults to USDC.",
+                },
+                quote_expiry_seconds: {
+                    type: "integer",
+                    minimum: 10,
+                    maximum: 600,
+                    description: "Digest validity horizon from now. Defaults to 600 seconds for MCP-operated fills.",
+                },
+                timeout_ms: {
+                    type: "integer",
+                    minimum: 5000,
+                    maximum: 600000,
+                    description: "How long to wait for buyer_tx_request/fill_executed. Defaults to 120000; max 10 minutes.",
+                },
+                relay_url: {
+                    type: "string",
+                    description: "Optional relay WebSocket URL. Defaults to the Skew devnet relay.",
+                },
+            },
+            required: ["relay_nonce", "cm_pubkey", "underlying", "payoff", "strike", "expiry", "notional"],
+        },
+    },
+    {
+        name: "skew_hit_instant_rfq_from_auction_quote",
+        description: "Execute a selected quote from skew_request_instant_rfq_from_auction through atomic_fill_from_relay. Provide premium_micro or premium_usd; premium_micro is preferred when copied from quote_ack. Refetches the Auction RFQ PDA, derives the same Instant terms, then returns tx, option PDA, PM lock delta, buyer-long readback, maker-short readback, and CM registry/margin proof.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                auction: {
+                    type: "string",
+                    description: "Auction RFQ PDA base58. The configured MCP wallet must be this auction's buyer.",
+                },
+                relay_nonce: {
+                    type: "string",
+                    description: "relay_nonce returned by skew_request_instant_rfq_from_auction.",
+                },
+                cm_pubkey: {
+                    type: "string",
+                    description: "CM/MM authority pubkey from a quote_ack.",
+                },
+                premium_micro: {
+                    type: "string",
+                    description: "Selected premium in USDC micro-units, usually copied from the quote_ack. Required unless premium_usd is supplied.",
+                },
+                premium_usd: {
+                    type: "number",
+                    description: "Alternative selected premium in USD. Required only when premium_micro is omitted.",
+                },
+                max_premium_micro: {
+                    type: "string",
+                    description: "Optional premium-cap override used only to rebuild/display the derived Instant RFQ request.",
+                },
+                settlement_mint: {
+                    type: "string",
+                    description: "Optional settlement mint override. Defaults to USDC for non-inverse Auction RFQs.",
+                },
+                quote_expiry_seconds: {
+                    type: "integer",
+                    minimum: 10,
+                    maximum: 600,
+                    description: "Digest validity horizon from now. Defaults to 600 seconds.",
+                },
+                timeout_ms: {
+                    type: "integer",
+                    minimum: 5000,
+                    maximum: 600000,
+                    description: "How long to wait for buyer_tx_request/fill_executed. Defaults to 120000; max 10 minutes.",
+                },
+                relay_url: {
+                    type: "string",
+                    description: "Optional relay WebSocket URL. Defaults to the Skew devnet relay.",
+                },
+            },
+            required: ["auction", "relay_nonce", "cm_pubkey"],
+        },
+    },
+    {
+        name: "skew_serve_instant_rfq_mm_once",
+        description: "Maker/MM one-shot Instant RFQ signer. Provide premium_micro or premium_usd; premium_micro is preferred for exact USDC micro-units. Prepares CM, volume tracker, and RFQ maker registry if requested, then listens on the relay, quotes the next matching request, signs fill_consent, and returns the final fill/margin receipt. Use in a separate terminal while a buyer requests and hits an Instant RFQ.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                premium_micro: {
+                    type: "string",
+                    description: "Fixed quote premium in USDC micro-units. Required unless premium_usd is supplied. Use a small value for devnet demos.",
+                },
+                premium_usd: {
+                    type: "number",
+                    description: "Alternative fixed quote premium in USD. Required only when premium_micro is omitted.",
+                },
+                quote_ttl_seconds: {
+                    type: "integer",
+                    minimum: 5,
+                    maximum: 600,
+                    description: "TTL included in quote_ack. Defaults to 600 for demo-safe quote review.",
+                },
+                timeout_ms: {
+                    type: "integer",
+                    minimum: 5000,
+                    maximum: 600000,
+                    description: "How long to wait for quote request and fill completion. Defaults to 600000.",
+                },
+                auto_prepare: {
+                    type: "boolean",
+                    description: "Default true. Registers CM, volume tracker, and RFQ maker registry if missing/idempotent.",
+                },
+                initial_collateral_usdc: {
+                    type: "number",
+                    description: "If CM is missing and auto_prepare is true, register with this initial USDC collateral. Defaults to 1000.",
+                },
+                filter_underlying: {
+                    type: "string",
+                    enum: UNDERLYING_ENUM,
+                    description: "Optional quote_request asset filter.",
+                },
+                filter_payoff: {
+                    type: "string",
+                    enum: PAYOFF_ENUM,
+                    description: "Optional quote_request payoff filter.",
+                },
+                relay_url: {
+                    type: "string",
+                    description: "Optional relay WebSocket URL. Defaults to the Skew devnet relay.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
         name: "skew_fetch_collateral_policy",
         description: "Read the live CollateralPolicyPda mint allowlist for this deployment. Capabilities show protocol support; this tool shows which USDC/wSOL/jitoSOL/custom mints are actually registered now, so agents can preflight before sending write transactions.",
         inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "skew_fetch_pm_cache",
+        description: "Read a CM's on-chain PM cache sidecar and return whether cached margin / cached fill can be used. Reports dirty/stale/registry mismatch blockers explicitly. Read-only.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                cm_authority: {
+                    type: "string",
+                    description: "CM authority wallet. Defaults to the configured MCP write wallet if omitted.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_preview_incremental_margin",
+        description: "Preview the PM cache envelope for a candidate fill. This is read-only and not an execution guarantee; exact post-fill IM is still produced by relay/SDK transaction preflight.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                cm_authority: {
+                    type: "string",
+                    description: "CM authority wallet. Defaults to the configured MCP write wallet if omitted.",
+                },
+                estimated_post_im_micro: {
+                    type: "string",
+                    description: "Optional post-fill IM estimate in USDC micro-units. If omitted, the tool returns cache status only.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_list_rent_reclaimable",
+        description: "List owner-first rent reclaim candidates for a wallet. Returns close blockers instead of pretending unsafe accounts can be closed. Read-only.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                authority: {
+                    type: "string",
+                    description: "Wallet whose reclaim queue should be scanned. Defaults to the configured MCP write wallet if omitted.",
+                },
+            },
+            required: [],
+        },
     },
     {
         name: "skew_settle_option",
@@ -162,6 +605,36 @@ export const SKEW_TOOLS = [
         },
     },
     {
+        name: "skew_liquidate_option",
+        description: "Attempt Dutch-auction liquidation against a PM-issued option for a defaulting Clearing Member. Permissionless, but guarded: the liquidator must differ from the defaulting CM and healthy CMs are rejected by the on-chain liquidation trigger.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                option_address: {
+                    type: "string",
+                    description: "PM-issued option PDA address (base58) to liquidate.",
+                },
+                defaulting_cm_authority: {
+                    type: "string",
+                    description: "Authority pubkey of the writer/defaulting Clearing Member.",
+                },
+                close_factor_bps: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 5000,
+                    description: "Liquidation close factor in bps. Defaults to 5000 (50%).",
+                },
+                min_expected_bonus_bps: {
+                    type: "integer",
+                    minimum: 0,
+                    maximum: 10000,
+                    description: "Optional Dutch bonus floor. Defaults to 0 for keeper smoke checks.",
+                },
+            },
+            required: ["option_address", "defaulting_cm_authority"],
+        },
+    },
+    {
         name: "skew_get_margin",
         description: "Recompute initial margin (IM) for the caller's Clearing Member account and return the breakdown. Reads on-chain volatility-state PDAs for the 5 launch assets so tail-risk add-on is included. Returns total collateral, locked IM, free collateral, and the on-chain tx signature. Requires SKEW_PRIVATE_KEY (caller must already be a registered CM). Use this before skew_create_option to check whether the wallet has free collateral, or after a price move to refresh the IM.",
         inputSchema: {
@@ -172,6 +645,34 @@ export const SKEW_TOOLS = [
                     description: "Current spot USD used as the stress-sim anchor. Optional — defaults to live BTC spot from Pyth Hermes.",
                 },
             },
+        },
+    },
+    {
+        name: "skew_refresh_pm_cache_full",
+        description: "Run the full PM walk and refresh the CM risk-cache sidecar. Requires a configured write keypair and the CM's registry-tracked option accounts.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                current_spot_usd: {
+                    type: "number",
+                    description: "Optional stress anchor. Defaults to 0; PM model uses account/oracle inputs.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_prepare_rent_reclaim_batch",
+        description: "Prepare an unsigned owner-first rent reclaim batch for wallet signing. The MCP server does not close accounts server-side.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                authority: {
+                    type: "string",
+                    description: "Wallet whose reclaimable accounts should be prepared. Defaults to the configured MCP write wallet if omitted.",
+                },
+            },
+            required: [],
         },
     },
     {
@@ -207,7 +708,16 @@ export const SKEW_TOOLS = [
     // ──────────────────────────────────────────────────────────────────────
     {
         name: "skew_get_capabilities",
-        description: "Return Skew's supported assets, 11 payoff names, collateral rails, and trade lanes. Use this before building a dApp, bot, MCP workflow, or UI route so the client chooses Instant RFQ vs Auction RFQ vs pre-funded listings correctly.",
+        description: "Return Skew's supported assets, 11 payoff names, collateral rails, trade lanes, profile counts, and MCP agentGuide. Call this immediately after skew_get_signer_info so the agent chooses Instant RFQ vs Auction RFQ vs secondary vs pre-funded issuance correctly.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+            required: [],
+        },
+    },
+    {
+        name: "skew_get_signer_info",
+        description: "First tool before any write workflow. Returns the active MCP signer posture: local keypair path/private-key mode, hosted unsigned mode, active profile, visible tool count, and the signer public key when a local write key is configured. Use it to prove which wallet will pay fees and sign transactions; if write_tools_enabled=false, do read-only analysis instead of pretending to trade.",
         inputSchema: {
             type: "object",
             properties: {},
@@ -274,6 +784,18 @@ export const SKEW_TOOLS = [
                     type: "number",
                     description: "Max number of options to return (default 10, max 50).",
                 },
+                filter_option_pda: {
+                    type: "string",
+                    description: "Fetch a single option PDA directly. Use this for receipt/readback after a known tx instead of scanning the whole market.",
+                },
+                holder: {
+                    type: "string",
+                    description: "Filter by current option holder wallet pubkey.",
+                },
+                creator: {
+                    type: "string",
+                    description: "Filter by option creator / writer wallet pubkey.",
+                },
                 underlying: {
                     type: "string",
                     enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"],
@@ -311,6 +833,159 @@ export const SKEW_TOOLS = [
                 },
             },
             required: [],
+        },
+    },
+    {
+        name: "skew_fetch_portfolio",
+        description: "Read a wallet's live Skew portfolio directly from on-chain OptionAccount PDAs. Long side = current holder; short side = creator/writer. Also includes Clearing Member state when registered. Use this after create/buy/transfer to prove the option is visible, not just minted.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                owner: {
+                    type: "string",
+                    description: "Wallet pubkey base58. Defaults to configured MCP write wallet. Required when the MCP server is running read-only without a write keypair.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_list_rfq_auctions",
+        description: "List live Auction RFQs from the same public RFQ tape used by the terminal. This discovers auction PDAs before you know their address by merging the indexer view with a bounded on-chain snapshot. Use this before `skew_fetch_rfq_auction`, quote submission, or finalize workflows.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: {
+                    type: "number",
+                    description: "Max number of RFQs to return (default 25, max 100).",
+                },
+                buyer: {
+                    type: "string",
+                    description: "Filter by buyer wallet pubkey (optional).",
+                },
+                underlying: {
+                    type: "string",
+                    enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"],
+                    description: "Filter by underlying asset (optional).",
+                },
+                with_quote: {
+                    type: "boolean",
+                    description: "Only return RFQs with a currently live best quote.",
+                },
+                source: {
+                    type: "string",
+                    enum: ["indexer", "onchain"],
+                    description: "Optional source override. Omit for terminal-equivalent indexer plus on-chain snapshot.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_list_secondary_listings",
+        description: "List the public secondary tape from the same listing endpoint used by the terminal. This is discovery/readback only, not an escrowed orderbook. Payment uses skew_buy_secondary_listing and delivery is complete only after seller-side skew_transfer_option returns readback_ok=true.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: {
+                    type: "number",
+                    description: "Max number of listings to return (default 25, max 100).",
+                },
+                underlying: {
+                    type: "string",
+                    enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"],
+                    description: "Filter by underlying asset (optional).",
+                },
+                active: {
+                    type: "boolean",
+                    description: "Return active listings only. Defaults to true.",
+                },
+                pending: {
+                    type: "boolean",
+                    description: "Return listings that are still pending off-chain settlement/indexer confirmation.",
+                },
+                seller: {
+                    type: "string",
+                    description: "Filter by listing seller wallet pubkey.",
+                },
+                option_pda: {
+                    type: "string",
+                    description: "Filter listings for one option PDA.",
+                },
+                min_qty: {
+                    type: "number",
+                    description: "Minimum token amount filter.",
+                },
+                max_ask_usdc: {
+                    type: "number",
+                    description: "Maximum ask price in USDC.",
+                },
+                exclude_me: {
+                    type: "string",
+                    description: "Exclude listings posted by this seller wallet pubkey.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_create_secondary_listing",
+        description: "Post a seller-signed secondary-market discovery row for an option the configured MCP wallet currently holds. This does not escrow or lock the option. Actual delivery is explicit seller-side skew_transfer_option after a buyer pays or accepts terms.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                option_address: {
+                    type: "string",
+                    description: "OptionAccount PDA to offer on the secondary tape.",
+                },
+                option_token_mint: {
+                    type: "string",
+                    description: "Option SPL mint. Optional; SDK derives it from option_address when omitted.",
+                },
+                ask_price_usdc: {
+                    type: "number",
+                    description: "Total ask in USDC for the offered token amount.",
+                },
+                token_amount: {
+                    type: "number",
+                    description: "Option token amount offered. Defaults to 1.",
+                },
+                duration_hours: {
+                    type: "number",
+                    description: "Listing time-to-live in hours. Defaults to 24, max 720.",
+                },
+                seller_handle: {
+                    type: "string",
+                    description: "Optional public label for the seller.",
+                },
+            },
+            required: ["option_address", "ask_price_usdc"],
+        },
+    },
+    {
+        name: "skew_buy_secondary_listing",
+        description: "Pay a secondary listing seller in devnet USDC and record a buyer-signed buy intent on the public tape. The SDK refetches the listing and option before payment, verifies the seller is still the current holder, and uses seller/option/ask args only as optional guards. This is not escrow/orderbook settlement: delivery is complete only after the seller calls skew_transfer_option and that tool returns readback_ok=true.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                listing_id: {
+                    type: "string",
+                    description: "Secondary listing row id.",
+                },
+                option_address: {
+                    type: "string",
+                    description: "Optional OptionAccount PDA guard from the listing.",
+                },
+                seller: {
+                    type: "string",
+                    description: "Optional seller wallet pubkey guard from the listing.",
+                },
+                ask_price_usdc: {
+                    type: "number",
+                    description: "Optional total USDC ask guard from the listing.",
+                },
+            },
+            required: ["listing_id"],
         },
     },
     // ──────────────────────────────────────────────────────────────────────
@@ -455,7 +1130,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_get_margin_breakdown",
-        description: "Compute the off-chain Verified-tier portfolio-margin breakdown for a candidate options portfolio via the skew-pricing /margin_breakdown endpoint. Phase 1633.B unified PM (2026-04-30): every tier now flows through the same closed-form ConvexHullIM 2-dim Taylor envelope; rungs differ in calendar netting bps + smile/ICC refinements added on top. Pass `tier` to select the rung — Standard ($0 lockup, 0% calendar), Silver ($500K, 50% calendar + Hamilton stress L_a), Gold ($2M, 5-dim SSVI smile + 85% calendar), or Platinum ($10M, 25-dim cross-asset ICC adjustment). The response always returns the full IM ladder under all 4 tiers (`tier_ladder_im_usd`) so a CM can see savings before upgrading. Advisory-only — the on-chain calculate_margin handler runs the same closed-form math.",
+        description: "Compute the off-chain clearing-class portfolio-margin breakdown for a candidate options portfolio via the skew-pricing /margin_breakdown endpoint. Launch PM policy (2026-05-08): conservative ConvexHullIM/floor stack, calendar credit disabled, non-vanilla Greek credit audit-gated, and ICC credit applied once under a capped policy. Pass `tier` as the compatibility value: standard=M0 Segregated, silver=M1 Portfolio, gold=M2 Cross-Asset, platinum=M3 Clearing Prime. The response returns a full class ladder for transparency. Advisory-only — the on-chain calculate_margin handler remains the final risk check.",
         inputSchema: {
             type: "object",
             properties: {
@@ -487,33 +1162,33 @@ export const SKEW_TOOLS = [
                 regime: {
                     type: "string",
                     enum: ["Calm", "Stress"],
-                    description: "Regime to drive the per-asset shock and ICC ρ matrix. Default Calm. The Platinum tier returns both calm and stress IMs side-by-side; lower tiers omit regime fields.",
+                    description: "Regime to drive the per-asset shock and ICC rho matrix. Default Calm. M3 returns both calm and stress IMs side-by-side; lower classes omit regime fields.",
                 },
                 tier: {
                     type: "string",
                     enum: ["standard", "silver", "gold", "platinum"],
-                    description: "Verified-tier capital-ladder rung. Default `platinum` (full closed-form). Lockup schedule: Standard $0, Silver $500K, Gold $2M, Platinum $10M (30-day lockup). The full ladder under all 4 tiers is always returned in `tier_ladder_im_usd`.",
+                    description: "Clearing-class compatibility value. Default `platinum` maps to M3 Clearing Prime. Lockup schedule: M0 $0, M1 $500K, M2 $2M, M3 $10M (30-day lockup). The full ladder under all 4 classes is returned in `tier_ladder_im_usd` for backward-compatible clients.",
                 },
             },
             required: ["legs"],
         },
     },
     // ──────────────────────────────────────────────────────────────────────
-    // Phase 1639 — Verified-tier ladder + RFQ auction + conditional orders +
+    // Phase 1639 — clearing-class ladder + RFQ auction + conditional orders +
     //              read snapshots. Closes the MCP coverage gap identified in
     //              CHANGE_PLAN.md §4. Lets LLM agents drive Iron Condor
     //              workflows, SL/TP/OCO, and read on-chain state directly.
     // ──────────────────────────────────────────────────────────────────────
     {
         name: "skew_upgrade_tier",
-        description: "Step the Clearing Member up to a higher Verified tier. Locks the tier-specific USDC floor for 30 days (TIER_LOCKUP_MIN_SECONDS). Strict rank increase only. Tier ladder: 0=Standard ($0), 1=Silver ($500K), 2=Gold ($2M), 3=Platinum ($10M). Higher tier unlocks 50/85% calendar netting, 5-dim SSVI, 25-dim cross-asset ICC.",
+        description: "Step the Clearing Member up to a higher clearing class. Locks the class-specific USDC floor for 30 days (TIER_LOCKUP_MIN_SECONDS). Strict rank increase only. Compatibility ladder: 0=M0 Segregated ($0), 1=M1 Portfolio ($500K), 2=M2 Cross-Asset ($2M), 3=M3 Clearing Prime ($10M). Launch policy: conservative PM floors, calendar credit disabled, and unaudited non-vanilla Greek credit disabled.",
         inputSchema: {
             type: "object",
             properties: {
                 target_rank: {
                     type: "integer",
                     enum: [0, 1, 2, 3],
-                    description: "Target Verified tier rank.",
+                    description: "Target clearing-class compatibility rank.",
                 },
             },
             required: ["target_rank"],
@@ -521,14 +1196,14 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_downgrade_tier",
-        description: "Step the CM down to a lower Verified tier. Releases tier-specific USDC lockup back to free_collateral. Requires now ≥ tier_locked_until (30 days after most recent upgrade). Strict rank decrease only.",
+        description: "Step the CM down to a lower clearing class. Releases class-specific USDC lockup back to free_collateral. Requires now >= tier_locked_until (30 days after most recent upgrade). Strict rank decrease only.",
         inputSchema: {
             type: "object",
             properties: {
                 target_rank: {
                     type: "integer",
                     enum: [0, 1, 2, 3],
-                    description: "Target Verified tier rank (must be strictly less than current).",
+                    description: "Target clearing-class compatibility rank (must be strictly less than current).",
                 },
             },
             required: ["target_rank"],
@@ -536,7 +1211,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_register_rfq_auction",
-        description: "Open the Auction RFQ lane for an option spec. Current RFQ v1 escrow is USDC/stable-only; buyer commits max_premium_micro and sets a 30..1200 slot competition window. Multi-MM compete via submit_rfq_quote; finalize_rfq_auction is price-discovery/event finalization, not 1-click HIT. Expiry must match the standard on-chain tenor ladder (1d, 7d, 14d, 28d, 90d) within ±1h. For immediate click-to-fill, use the separate Instant RFQ relay lane (buyer_accept + cm_sign + buyer_tx_signed over RelayPayload → atomic_fill_from_relay). Phase 2 (2026-05-04) appends Inverse payoff types (asset_mask must be enabled per asset). Returns the auction PDA.",
+        description: "Open the Auction RFQ lane for an option spec. Current RFQ v1 escrow is USDC/stable-only; buyer commits max_premium_micro and sets a 30..1200 slot competition window. Multi-MM compete via submit_rfq_quote/direct; anyone can call finalize_rfq_auction after close_slot to publish the firm quote tape and refund escrow. Important: finalize_rfq_auction is not an option mint. PM/CM-backed minting routes through Instant RFQ atomic fill (buyer_accept + cm_sign + buyer_tx_signed over RelayPayload → atomic_fill_from_relay), or the guarded pre-funded bridge tools when intentionally using fully collateralized legacy issuance. Expiry must match the standard on-chain tenor ladder (1d, 7d, 14d, 28d, 90d) within ±1h. Phase 2 (2026-05-04) appends Inverse payoff types (asset_mask must be enabled per asset). Returns the auction PDA.",
         inputSchema: {
             type: "object",
             properties: {
@@ -616,7 +1291,11 @@ export const SKEW_TOOLS = [
                     enum: ["CloseIsolatedPosition"],
                     description: "Only executable MCP action. Other conditional action types are SDK-only fail-closed intents.",
                 },
-                underlying: { type: "string", enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"] },
+                underlying: {
+                    type: "string",
+                    enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"],
+                    description: "Underlying asset for the conditional order.",
+                },
                 trigger_price_usd: { type: "number", description: "Pyth scale auto-converted to 1e8." },
                 action_target: {
                     type: "string",
@@ -678,7 +1357,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_fetch_clearing_member",
-        description: "Read a Clearing Member account snapshot — collateral, IF contribution, tier lockup, total_pm_locked, free_collateral, net notional, last_im_micro, Verified tier, tier_locked_until, under_liquidation flag. Drives risk diagnostics: equity vs IM ratio (liquidation trigger if < 1.10), tier upgrade headroom, free capital for new positions.",
+        description: "Read a Clearing Member account snapshot — collateral, IF contribution, clearing-class lockup, total_pm_locked, free_collateral, net notional, last_im_micro, class rank, tier_locked_until, under_liquidation flag. Drives risk diagnostics: equity vs IM ratio (liquidation trigger if < 1.10), class upgrade headroom, free capital for new positions.",
         inputSchema: {
             type: "object",
             properties: {
@@ -709,31 +1388,30 @@ export const SKEW_TOOLS = [
         inputSchema: {
             type: "object",
             properties: {
-                underlying: { type: "string", enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"] },
+                underlying: {
+                    type: "string",
+                    enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"],
+                    description: "Asset symbol. Required unless asset, assetIdx, or asset_idx is supplied.",
+                },
                 asset: {
                     type: "string",
                     enum: ["BTC", "ETH", "SOL", "XRP", "HYPE"],
-                    description: "Alias for underlying; case-insensitive.",
+                    description: "Alias for underlying; case-insensitive. Required unless another asset selector is supplied.",
                 },
                 assetIdx: {
                     type: "integer",
                     minimum: 0,
                     maximum: 4,
-                    description: "Numeric asset enum: BTC=0, ETH=1, SOL=2, XRP=3, HYPE=4.",
+                    description: "Numeric asset enum: BTC=0, ETH=1, SOL=2, XRP=3, HYPE=4. Required unless a symbol selector is supplied.",
                 },
                 asset_idx: {
                     type: "integer",
                     minimum: 0,
                     maximum: 4,
-                    description: "Snake-case alias for assetIdx.",
+                    description: "Snake-case alias for assetIdx. Required unless a symbol selector is supplied.",
                 },
             },
-            anyOf: [
-                { required: ["underlying"] },
-                { required: ["asset"] },
-                { required: ["assetIdx"] },
-                { required: ["asset_idx"] },
-            ],
+            required: [],
         },
     },
     {
@@ -762,7 +1440,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_fetch_cross_asset",
-        description: "Read singleton CrossAssetMatrix — 10 pairwise correlations + 10 stress-conditional correlations across BTC/ETH/SOL/XRP/HYPE. Drives ICC adjustment for Gold+ Verified tier portfolio margin.",
+        description: "Read singleton CrossAssetMatrix — 10 pairwise correlations + 10 stress-conditional correlations across BTC/ETH/SOL/XRP/HYPE. Drives ICC adjustment for M2/M3 clearing-class portfolio margin.",
         inputSchema: { type: "object", properties: {} },
     },
     {
@@ -829,6 +1507,23 @@ export const SKEW_TOOLS = [
         },
     },
     {
+        name: "skew_list_rfq_quotes",
+        description: "Read the full quote-depth tape for one RFQ auction PDA from the public web/indexer API. This is read-only and complements skew_fetch_rfq_auction, which only exposes the on-chain best quote snapshot.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                auction: { type: "string", description: "RFQ auction PDA base58." },
+                limit: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 100,
+                    description: "Maximum quotes to return. Defaults to 50.",
+                },
+            },
+            required: ["auction"],
+        },
+    },
+    {
         name: "skew_fetch_combo_intent_v2",
         description: "Read a ComboIntentPdaV2 — header (status, leg_count, legs_filled, total_max_premium, expires_ts) + per-leg detail (option / side / filled / max_premium / fill_premium) for the first leg_count slots.",
         inputSchema: {
@@ -845,14 +1540,79 @@ export const SKEW_TOOLS = [
     // ──────────────────────────────────────────────────────────────────────
     {
         name: "skew_transfer_option",
-        description: "Transfer the option SPL token to a new holder. Atomic — burn from caller's ATA, mint to new holder's ATA. Caller pays rent for the new ATA if absent.",
+        description: "Transfer an existing option SPL token to a new non-creator holder and update the OptionAccount holder field. Provide option or option_address. Returns tx plus holder/portfolio readback; treat delivery as complete only when readback_ok=true. This is the current verified secondary execution primitive; it is not an escrowed orderbook fill and it is not a PM buyback/close. The SDK rejects transfers back to the option creator because that would require a dedicated buyback close to keep the writer registry and PM lock consistent. Caller pays rent for the destination ATA if absent.",
         inputSchema: {
             type: "object",
             properties: {
-                option: { type: "string", description: "Option PDA base58." },
+                option: {
+                    type: "string",
+                    description: "Option PDA base58. Required unless option_address is supplied.",
+                },
+                option_address: {
+                    type: "string",
+                    description: "Alias for option. Required unless option is supplied; accepted for consistency with skew_buy_option output.",
+                },
                 new_holder: { type: "string", description: "Destination wallet pubkey base58." },
             },
-            required: ["option", "new_holder"],
+            required: ["new_holder"],
+        },
+    },
+    {
+        name: "skew_track_held_position",
+        description: "Register an Active option currently held by the configured wallet into that wallet's Clearing Member PositionRegistry as a PM long hedge. Use this after a CM buys or receives a long option so calculate_margin and future atomic_fill_from_relay checks can see the hedge. This mutates the CM registry; it is not needed for ordinary non-CM retail holds.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                option: {
+                    type: "string",
+                    description: "Option PDA address (base58). Alias option_address is also accepted.",
+                },
+                option_address: {
+                    type: "string",
+                    description: "Alias for option.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_untrack_held_position",
+        description: "Remove an option held by the configured wallet from that wallet's PM PositionRegistry before transfer/close workflows. The wallet must still be the current holder.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                option: {
+                    type: "string",
+                    description: "Option PDA address (base58). Alias option_address is also accepted.",
+                },
+                option_address: {
+                    type: "string",
+                    description: "Alias for option.",
+                },
+            },
+            required: [],
+        },
+    },
+    {
+        name: "skew_rebalance_pm_lock",
+        description: "Recompute PM for the option writer and release excess marginal IM from the option escrow back into the writer CM escrow. Use after hedges are tracked or after calculate_margin shows the book needs less escrow. max_release_usdc=0 releases all eligible excess.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                option: {
+                    type: "string",
+                    description: "Option PDA address (base58). Alias option_address is also accepted.",
+                },
+                option_address: {
+                    type: "string",
+                    description: "Alias for option.",
+                },
+                max_release_usdc: {
+                    type: "number",
+                    description: "Maximum USDC to release. Defaults to 0, meaning release all eligible excess.",
+                },
+            },
+            required: [],
         },
     },
     {
@@ -914,7 +1674,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_register_clearing_member",
-        description: "One-time onboarding: enrolls the caller as a Clearing Member. Initialises the ClearingMemberPda + USDC escrow. Required before opening any cross-margined position. Must deposit at least the Standard tier minimum (typically $0 floor — but a non-zero seed is recommended).",
+        description: "One-time onboarding: enrolls the caller as a Clearing Member. Initialises the ClearingMemberPda + USDC escrow. Required before opening any cross-margined position. Starts in the M0 Segregated clearing class (no class floor, but a non-zero seed is recommended).",
         inputSchema: {
             type: "object",
             properties: {
@@ -987,7 +1747,7 @@ export const SKEW_TOOLS = [
     // ──────────────────────────────────────────────────────────────────────
     {
         name: "skew_register_rfq_maker",
-        description: "One-time enrollment: register the caller as an RFQ market maker. Locks the maker-deposit USDC for ed25519-quote slashing collateral.",
+        description: "One-time enrollment: register the caller as an RFQ market maker. Locks the maker-deposit in SOL for quote slashing/rent. The wallet needs at least 1.02 SOL before this call.",
         inputSchema: { type: "object", properties: {} },
     },
     {
@@ -1014,6 +1774,25 @@ export const SKEW_TOOLS = [
         },
     },
     {
+        name: "skew_submit_rfq_quote_direct",
+        description: "Browser/operator-wallet RFQ quote lane. The caller's wallet signs the transaction directly; no detached signMessage/Ed25519 signature is required. Use this for terminal MM quote submissions.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                auction: { type: "string", description: "Auction PDA base58." },
+                premium_micro: {
+                    type: "string",
+                    description: "Quoted premium (USDC micro) as bigint string.",
+                },
+                valid_until_slot: {
+                    type: "string",
+                    description: "Quote-validity expiry slot as bigint string.",
+                },
+            },
+            required: ["auction", "premium_micro", "valid_until_slot"],
+        },
+    },
+    {
         name: "skew_finalize_rfq_auction",
         description: "Permissionless finalize past close_slot. Selects the winning quote, refunds the RFQ escrow to the buyer, and emits the settlement signal; actual option mint + MM premium transfer is done by the follow-up atomic_fill_from_relay path.",
         inputSchema: {
@@ -1022,10 +1801,10 @@ export const SKEW_TOOLS = [
                 auction: { type: "string", description: "Auction PDA base58." },
                 buyer_usdc_ata: {
                     type: "string",
-                    description: "Buyer's USDC ATA pubkey base58 (where unused premium is refunded).",
+                    description: "Optional buyer USDC ATA pubkey base58. If omitted, SDK derives it from the auction buyer and configured USDC mint.",
                 },
             },
-            required: ["auction", "buyer_usdc_ata"],
+            required: ["auction"],
         },
     },
     {
@@ -1629,13 +2408,13 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_estimate_fee",
-        description: "Compute the v5.1 effective fee for a candidate options trade — VIP × Verified-tier × Builder. Returns effective bps, USD fee, fee-cap state (12.5% of premium), and the protocol/builder split. Skew v5.1 is Deribit-symmetric (3.0/3.0 bps base) so retail matches global #1; Platinum + VIP6 reaches 0.70 bps (30% cheaper than Deribit VIP6). VIP volume thresholds are Solana-context (Deribit ÷10): VIP1 = $25K equity, VIP2 = $250K, VIP3 = $5M, VIP4 = $25M, VIP5 = $100M, VIP6 = $500M (30d rolling options volume). Verified-tier extra discount applies to TAKER only (10/20/30% for Silver/Gold/Platinum). Builder code share is 25% of effective taker. Spec: docs/fee-schedule-v5.1.md.",
+        description: "Compute the launch effective fee for a candidate options trade — VIP volume, clearing-class discount, and optional builder share. Returns effective bps, USD fee, fee-cap state, and the protocol/builder split. Public classes are M0 Segregated, M1 Portfolio, M2 Cross-Asset, and M3 Clearing Prime; compatibility values remain standard/silver/gold/platinum for IDL stability. Builder code share is 25% of effective taker. Spec: docs/fee-schedule-v5.1.md.",
         inputSchema: {
             type: "object",
             properties: {
                 volume_30d_usd: {
                     type: "number",
-                    description: "Caller's 30-day rolling options notional in USD. Drives VIP tier resolution (VIP2..VIP6 thresholds: $250K, $5M, $25M, $100M, $500M).",
+                    description: "Caller's 30-day rolling options notional in USD. Drives VIP volume discount resolution.",
                 },
                 equity_usd: {
                     type: "number",
@@ -1644,12 +2423,12 @@ export const SKEW_TOOLS = [
                 verified_tier: {
                     type: "string",
                     enum: ["standard", "silver", "gold", "platinum"],
-                    description: "Verified-tier capital-ladder rung. Adds 0/10/20/30% extra TAKER discount on top of VIP. Maker fee is unaffected by Verified tier (options-spec parity). Default `standard`.",
+                    description: "Clearing-class compatibility value. Adds 0/10/20/30% taker discount on top of VIP. Maker fee is unaffected by clearing class. Default `standard` = M0.",
                 },
                 side: {
                     type: "string",
                     enum: ["taker", "maker"],
-                    description: "Trade side. Default `taker`. Skew uses Deribit-symmetric base (3 bps maker = 3 bps taker), but only takers benefit from Verified-tier extra discount.",
+                    description: "Trade side. Default `taker`. Only takers benefit from clearing-class discount.",
                 },
                 premium_usd: {
                     type: "number",
@@ -1666,7 +2445,7 @@ export const SKEW_TOOLS = [
     // ── Phase 57301 (2026-05-04) — Paradigm-style OTC primitives ─────────────
     {
         name: "skew_take_best_quote",
-        description: "Deprecated: current skew_master IDL does not expose `take_best_quote`. Do not emulate it against RFQ-auction state. Use the Instant RFQ relay lane for click-to-fill, or skew_finalize_rfq_auction after close_slot for the Auction RFQ lane. Instant RFQ requires buyer_tx_signed because atomic_fill_from_relay has buyer: Signer. This tool intentionally returns an unsupported error for stale clients.",
+        description: "Buyer accepts the current best firm quote on an Auction RFQ. This refunds unused max-premium escrow and marks the auction tape as taken. For fully cleared PM/CM option minting, use the Instant RFQ atomic-fill lane.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1678,17 +2457,21 @@ export const SKEW_TOOLS = [
                     type: "number",
                     description: "Premium the trader saw at view time. Front-running guard — rejects with TakeQuotePriceMoved if a tighter quote has arrived between view and submit.",
                 },
+                expected_premium_micro: {
+                    type: "string",
+                    description: "Optional exact USDC-micro premium bigint string. If supplied, overrides expected_premium_usd.",
+                },
                 via_relay: {
                     type: "boolean",
-                    description: "Deprecated no-op. The relay take-best-quote endpoint is disabled with HTTP 410 in the current IDL epoch.",
+                    description: "Deprecated no-op. Relay-signed take-best-quote remains disabled because only the buyer wallet can sign this direct auction accept.",
                 },
             },
-            required: ["auction_pda", "expected_premium_usd"],
+            required: ["auction_pda"],
         },
     },
     {
         name: "skew_refresh_quote",
-        description: "Deprecated: current skew_master IDL does not expose `refresh_quote`. Submit a fresh signed quote with skew_submit_rfq_quote instead. This tool returns an unsupported error for stale clients.",
+        description: "Refresh the caller/MM's current best quote before close_slot. Requires a detached ed25519 signature over rfq_quote_digest, just like skew_submit_rfq_quote.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1706,7 +2489,7 @@ export const SKEW_TOOLS = [
                 },
                 mm_signature_b64: {
                     type: "string",
-                    description: "ed25519 signature (base64) over rfq_quote_digest. Caller signs externally.",
+                    description: "ed25519 signature (base58) over rfq_quote_digest. Caller signs externally.",
                 },
             },
             required: ["auction_pda", "premium_usd", "valid_until_slot", "mm_signature_b64"],
@@ -1714,7 +2497,7 @@ export const SKEW_TOOLS = [
     },
     {
         name: "skew_publish_axe",
-        description: "Deprecated: current skew_master IDL does not expose `publish_axe`. Axe board entries are indexer/off-chain only until the axe instruction family is restored. This tool returns an unsupported error.",
+        description: "Publish a live on-chain MakerAxe inventory-intent entry. This is an MM discovery primitive, not settlement; traders use axes to route RFQs to likely counterparties.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1754,8 +2537,51 @@ export const SKEW_TOOLS = [
         },
     },
     {
+        name: "skew_update_axe",
+        description: "Update a live on-chain MakerAxe inventory-intent entry. Owner/MM wallet only; pass the same mutable band, size, side, and validity fields used by publish.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                axe_pda: { type: "string", description: "Existing MakerAxe PDA (base58)." },
+                axe_id: {
+                    type: "number",
+                    description: "Caller-supplied PDA seed originally used for this MakerAxe.",
+                },
+                asset: { type: "number", description: "0=BTC / 1=ETH / 2=SOL / 3=XRP / 4=HYPE." },
+                side: { type: "number", enum: [-1, 0, 1], description: "-1 SELL / 0 TWO-WAY / +1 BUY." },
+                option_type_mask: {
+                    type: "number",
+                    description: "Bitmask over OptionType variants (Vanilla=0x01, Digital=0x02, CappedVanilla=0x04, RangeAccrual=0x08, VanillaInverse=0x10, DigitalInverse=0x20). Bits 10..15 reserved.",
+                },
+                strike_band_lo_usd: { type: "number" },
+                strike_band_hi_usd: { type: "number" },
+                expiry_band_lo_unix: { type: "number" },
+                expiry_band_hi_unix: { type: "number" },
+                size_usd: { type: "number" },
+                bid_premium_band_lo_usd: { type: "number" },
+                bid_premium_band_hi_usd: { type: "number" },
+                ask_premium_band_lo_usd: { type: "number" },
+                ask_premium_band_hi_usd: { type: "number" },
+                valid_until_unix: { type: "number" },
+            },
+            required: [
+                "axe_pda",
+                "axe_id",
+                "asset",
+                "side",
+                "option_type_mask",
+                "strike_band_lo_usd",
+                "strike_band_hi_usd",
+                "expiry_band_lo_unix",
+                "expiry_band_hi_unix",
+                "size_usd",
+                "valid_until_unix",
+            ],
+        },
+    },
+    {
         name: "skew_revoke_axe",
-        description: "Deprecated: current skew_master IDL does not expose `revoke_axe`. This tool returns an unsupported error.",
+        description: "Revoke/close a live MakerAxe entry. Rent returns to the MM wallet.",
         inputSchema: {
             type: "object",
             properties: {

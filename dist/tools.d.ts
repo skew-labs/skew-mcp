@@ -1,5 +1,7 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 export type SkewMcpProfile = "core" | "trading" | "rfq" | "advanced" | "governance" | "all";
+export declare function getSkewDisabledToolReason(name: string): string | null;
+export declare function isSkewReadOnlyTool(name: string): boolean;
 /**
  * MCP tool catalog for @skew-labs/mcp.
  *

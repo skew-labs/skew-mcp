@@ -2,35 +2,50 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { AnchorProvider, Program, Wallet } from "@coral-xyz/anchor";
 import bs58 from "bs58";
+import nacl from "tweetnacl";
 import { createRequire } from "module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { estimateFee, getSkewCapabilities, getMarginBreakdown, SkewClient, SKEW_PROGRAM_ID, JITOSOL_MINT, NATIVE_SOL_MINT, } from "@skew-labs/sdk";
-import { getSkewMcpProfile, getSkewTools } from "./tools.js";
+import { INSTANT_RFQ_DEFAULT_RELAY_URL, estimateFee, buildRelayPayload, collectInstantRfqQuotes, hitInstantRfqQuoteTxSigned, findSeriesListingPda, getSkewCapabilities, getMarginBreakdown, relayPayloadDigest, assertExpiryTenor, expiryFromTenorDays, SKEW_ALLOWED_TENORS_BY_UNDERLYING, TENOR_TOLERANCE_SECONDS, SkewClient, SKEW_PROGRAM_ID, JITOSOL_MINT, NATIVE_SOL_MINT, } from "@skew-labs/sdk";
+import { getSkewDisabledToolReason, getSkewMcpProfile, getSkewTools, isSkewReadOnlyTool, } from "./tools.js";
+const moduleRequire = createRequire(import.meta.url);
+const MCP_PACKAGE = moduleRequire("../package.json");
+const MCP_SERVER_VERSION = MCP_PACKAGE.version ?? "0.0.0";
 // ---------------------------------------------------------------------------
 // Config from env
 // ---------------------------------------------------------------------------
 const RPC_URL = process.env["SKEW_RPC_URL"] ?? "https://api.devnet.solana.com";
 const PRICING_URL = process.env["SKEW_PRICING_URL"] ?? "https://skew-pricing.fly.dev";
+const WEB_URL = process.env["SKEW_WEB_URL"] ?? "https://skew-web.vercel.app";
 const PRIVATE_KEY_B58 = process.env["SKEW_PRIVATE_KEY"] ?? "";
 const KEYPAIR_PATH = process.env["SKEW_KEYPAIR_PATH"] ?? process.env["KEYPAIR_PATH"] ?? "";
+const SIGNING_MODE_RAW = (process.env["SKEW_SIGNING_MODE"] ?? "local").toLowerCase();
+const SIGNING_MODE = SIGNING_MODE_RAW === "hosted" || SIGNING_MODE_RAW === "hosted_unsigned"
+    ? "hosted_unsigned"
+    : "local";
 const USDC_MINT = process.env["SKEW_DEVNET_USDC_MINT"] ?? "4T2KU8PXd25XvMh6kzv3F7d55yPP6NcS7HemERBe97K8";
 const MCP_PROFILE = getSkewMcpProfile(process.env["SKEW_MCP_PROFILE"]);
-const HAS_WRITE_KEYPAIR = Boolean(PRIVATE_KEY_B58 || KEYPAIR_PATH);
-function isReadOnlyTool(name) {
-    if (name === "skew_get_margin")
-        return false;
-    return (name.startsWith("skew_get_") ||
-        name.startsWith("skew_fetch_") ||
-        name.startsWith("skew_list_") ||
-        name.startsWith("skew_estimate_"));
-}
-const ACTIVE_TOOLS = getSkewTools(MCP_PROFILE).filter((tool) => HAS_WRITE_KEYPAIR || isReadOnlyTool(tool.name));
+const HAS_LOCAL_WRITE_SECRET = Boolean(KEYPAIR_PATH || PRIVATE_KEY_B58);
+const HAS_WRITE_KEYPAIR = SIGNING_MODE === "local" && HAS_LOCAL_WRITE_SECRET;
+const PROFILE_TOOLS = getSkewTools(MCP_PROFILE);
+const ACTIVE_TOOLS = PROFILE_TOOLS.filter((tool) => HAS_WRITE_KEYPAIR || isSkewReadOnlyTool(tool.name));
+const PROFILE_TOOL_NAMES = new Set(PROFILE_TOOLS.map((tool) => tool.name));
 const ACTIVE_TOOL_NAMES = new Set(ACTIVE_TOOLS.map((tool) => tool.name));
+const INSTANT_RFQ_MAX_WINDOW_MS = 10 * 60 * 1000;
+const INSTANT_RFQ_REQUEST_DEFAULT_TIMEOUT_MS = 60 * 1000;
+const INSTANT_RFQ_HIT_DEFAULT_TIMEOUT_MS = 120 * 1000;
+const INSTANT_RFQ_MAKER_DEFAULT_TIMEOUT_MS = INSTANT_RFQ_MAX_WINDOW_MS;
+const INSTANT_RFQ_DEFAULT_QUOTE_EXPIRY_SECONDS = 10 * 60;
+function clampInteger(raw, fallback, min, max) {
+    const n = Number(raw ?? fallback);
+    if (!Number.isFinite(n))
+        return fallback;
+    return Math.trunc(Math.min(Math.max(n, min), max));
+}
 // Pyth Hermes feed IDs for spot price queries
 const HERMES_FEED_IDS = {
     BTC: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
@@ -82,15 +97,80 @@ function expandUserPath(p) {
     return p;
 }
 function loadWriteKeypair() {
-    if (PRIVATE_KEY_B58) {
-        return Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY_B58));
-    }
     if (KEYPAIR_PATH) {
         const raw = fs.readFileSync(expandUserPath(KEYPAIR_PATH), "utf8");
         return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
     }
+    if (PRIVATE_KEY_B58) {
+        return Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY_B58));
+    }
     throw new Error("No write key configured. Set SKEW_KEYPAIR_PATH=/path/to/devnet.json " +
         "or SKEW_PRIVATE_KEY=<base58 secret> (KEYPAIR_PATH is also accepted).");
+}
+function localSignerSource() {
+    if (process.env["SKEW_KEYPAIR_PATH"])
+        return "SKEW_KEYPAIR_PATH";
+    if (process.env["KEYPAIR_PATH"])
+        return "KEYPAIR_PATH";
+    if (process.env["SKEW_PRIVATE_KEY"])
+        return "SKEW_PRIVATE_KEY";
+    return null;
+}
+function safeKeypairPathForJson() {
+    if (!KEYPAIR_PATH)
+        return null;
+    const expanded = expandUserPath(KEYPAIR_PATH);
+    const home = os.homedir();
+    if (expanded === home)
+        return "~";
+    if (expanded.startsWith(`${home}${path.sep}`)) {
+        return `~/${expanded.slice(home.length + 1)}`;
+    }
+    return expanded;
+}
+function signerInfoForJson(loadSigner) {
+    let signerPubkey = null;
+    let signerLoadError = null;
+    if (loadSigner && HAS_WRITE_KEYPAIR) {
+        try {
+            signerPubkey = loadWriteKeypair().publicKey.toBase58();
+        }
+        catch (e) {
+            signerLoadError = e instanceof Error ? e.message : String(e);
+        }
+    }
+    const warnings = [];
+    if (SIGNING_MODE === "hosted_unsigned") {
+        warnings.push("Hosted unsigned mode is active. This MCP server will not expose write tools or sign transactions with a shared server key.");
+    }
+    if (PRIVATE_KEY_B58 && KEYPAIR_PATH) {
+        warnings.push("Both SKEW_KEYPAIR_PATH/KEYPAIR_PATH and SKEW_PRIVATE_KEY are set. The local signer uses the keypair path first; unset SKEW_PRIVATE_KEY to avoid ambiguity.");
+    }
+    if (PRIVATE_KEY_B58 && !KEYPAIR_PATH) {
+        warnings.push("SKEW_PRIVATE_KEY is configured. Prefer SKEW_KEYPAIR_PATH for local devnet sessions so secrets stay in normal Solana keypair files.");
+    }
+    if (SIGNING_MODE === "local" && !HAS_LOCAL_WRITE_SECRET) {
+        warnings.push("No local write key is configured. Read-only tools are available; write tools are hidden until SKEW_KEYPAIR_PATH, KEYPAIR_PATH, or SKEW_PRIVATE_KEY is set.");
+    }
+    return {
+        package: "@skew-labs/mcp",
+        version: MCP_SERVER_VERSION,
+        rpc_url: RPC_URL,
+        web_url: WEB_URL,
+        signing_mode: SIGNING_MODE,
+        local_signer_configured: HAS_LOCAL_WRITE_SECRET,
+        write_tools_enabled: HAS_WRITE_KEYPAIR,
+        signer_pubkey: signerPubkey,
+        signer_load_error: signerLoadError,
+        signer_source: localSignerSource(),
+        keypair_path: safeKeypairPathForJson(),
+        private_key_env_configured: Boolean(PRIVATE_KEY_B58),
+        active_profile: MCP_PROFILE,
+        active_tool_count: ACTIVE_TOOLS.length,
+        profile_tool_count: PROFILE_TOOLS.length,
+        hidden_write_tools: hiddenWriteToolsForProfile(MCP_PROFILE),
+        warnings,
+    };
 }
 async function getSkewClient() {
     if (_skew)
@@ -116,6 +196,99 @@ function ok(text) {
 function err(msg) {
     return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
 }
+function typedErr(errorCode, message, extra = {}) {
+    return {
+        content: [
+            {
+                type: "text",
+                text: JSON.stringify({
+                    ok: false,
+                    error: message,
+                    error_code: errorCode,
+                    ...extra,
+                }, null, 2),
+            },
+        ],
+        isError: true,
+    };
+}
+function usdToMicro(raw, fallback = 0) {
+    return BigInt(Math.round(Number(raw ?? fallback) * 1_000_000));
+}
+function axeFieldsFromArgs(a) {
+    return {
+        axeId: BigInt(String(a["axe_id"])),
+        asset: Number(a["asset"]),
+        side: Number(a["side"]),
+        optionTypeMask: Number(a["option_type_mask"]),
+        strikeBandLo: usdToMicro(a["strike_band_lo_usd"]),
+        strikeBandHi: usdToMicro(a["strike_band_hi_usd"]),
+        expiryBandLo: BigInt(String(a["expiry_band_lo_unix"])),
+        expiryBandHi: BigInt(String(a["expiry_band_hi_unix"])),
+        sizeMicro: usdToMicro(a["size_usd"]),
+        bidPremiumBandLo: usdToMicro(a["bid_premium_band_lo_usd"]),
+        bidPremiumBandHi: usdToMicro(a["bid_premium_band_hi_usd"]),
+        askPremiumBandLo: usdToMicro(a["ask_premium_band_lo_usd"]),
+        askPremiumBandHi: usdToMicro(a["ask_premium_band_hi_usd"]),
+        validUntil: BigInt(String(a["valid_until_unix"])),
+    };
+}
+function optionSummaryForJson(s) {
+    if (!s)
+        return null;
+    const expiryTs = Number(s["expiryTs"] ?? 0);
+    return {
+        pda: s["pda"],
+        option_token_mint: s["optionTokenMint"],
+        creator: s["creator"],
+        holder: s["holder"],
+        option_type: s["optionType"],
+        state: s["state"],
+        underlying: s["underlying"],
+        direction: s["direction"],
+        strike_usd: s["strikeUsd"],
+        upper_bound_usd: s["upperBoundUsd"],
+        extra_param: s["extraParam"],
+        extra_param_usd: s["extraParamUsd"],
+        expiry_ts: expiryTs,
+        expiry_iso: expiryTs > 0 ? new Date(expiryTs * 1000).toISOString() : null,
+        payoff_usd: s["payoffUsd"],
+        collateral_locked_usd: s["collateralLockedUsd"],
+        v0_usd: s["v0Usd"],
+        sigma_at_creation: s["sigmaAtCreation"],
+        spot_at_creation_usd: s["spotAtCreationUsd"],
+        settled: s["settled"],
+        settled_price_usd: s["settledPriceUsd"],
+        settled_at: s["settledAt"],
+        metadata: s["metadata"],
+        metadata_status: s["metadataStatus"],
+        settlement_mint: s["settlementMint"],
+        settlement_decimals: s["settlementDecimals"],
+        created_at: s["createdAt"],
+    };
+}
+async function authorityFromArgs(a, key) {
+    const raw = a[key];
+    if (typeof raw === "string" && raw.length > 0)
+        return new PublicKey(raw).toBase58();
+    if (!HAS_WRITE_KEYPAIR) {
+        throw new Error(`${key} is required when no write keypair is configured`);
+    }
+    return (await getSkewClient()).walletPublicKey.toBase58();
+}
+async function skewWebJson(pathname, init) {
+    const url = new URL(pathname, WEB_URL);
+    const res = await fetch(url, init);
+    const text = await res.text();
+    if (!res.ok)
+        throw new Error(`Skew web API ${res.status}: ${text.slice(0, 400)}`);
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return { raw: text };
+    }
+}
 function unsupportedPayoffReason(underlying, payoff) {
     const caps = getSkewCapabilities();
     const asset = underlying.toUpperCase();
@@ -127,6 +300,121 @@ function unsupportedPayoffReason(underlying, payoff) {
         return `${payoff} is not enabled for ${asset}; allowed payoffs: ${allowed.join(", ")}`;
     }
     return null;
+}
+// ---------------------------------------------------------------------------
+// MCP self-description (W32-E, F-4 / F-8): expose the static MCP↔pricing-route
+// table and the per-profile exposure count so agents can self-introspect "I have
+// tool X → it hits pricing route Y" without reading source. Counts derive
+// from `getSkewTools(profile)` plus the runtime write-key filter, so profile
+// catalogs and currently visible tool surfaces are both explicit.
+// ---------------------------------------------------------------------------
+const MCP_PRICING_TOOL_ROUTE_MAP = [
+    { tool: "skew_get_fair_value", method: "POST", route: "/price" },
+    { tool: "skew_get_iv_smile", method: "POST", route: "/surface" },
+    { tool: "skew_get_term_structure", method: "POST", route: "/surface" },
+    { tool: "skew_get_volatility_summary", method: "POST", route: "/surface" },
+    { tool: "skew_get_vol_short", method: "POST", route: "/v1/vol/short" },
+    { tool: "skew_get_vol_long", method: "POST", route: "/v1/vol/long" },
+    { tool: "skew_get_vol_implied", method: "POST", route: "/v1/vol/iv" },
+    { tool: "skew_get_vol_premium", method: "POST", route: "/v1/vol/vrp" },
+    { tool: "skew_get_settlement_payoff", method: "POST", route: "/settlement_payoff" },
+    { tool: "skew_get_dvol_replication", method: "POST", route: "/dvol_replication" },
+    { tool: "skew_get_combo_quote", method: "POST", route: "/combo_quote" },
+    { tool: "skew_get_recovery_priority", method: "POST", route: "/recovery_priority" },
+    { tool: "skew_get_if_replenish_check", method: "POST", route: "/if_replenish_check" },
+    { tool: "skew_get_margin_breakdown", method: "POST", route: "/margin_breakdown" },
+    { tool: "skew_estimate_fee", method: "POST", route: "/estimate_fee" },
+];
+function getProfileToolCountByProfile() {
+    const profiles = ["core", "trading", "rfq", "advanced", "governance", "all"];
+    const out = {};
+    for (const p of profiles)
+        out[p] = getSkewTools(p).length;
+    return out;
+}
+function visibleToolsForProfile(profile) {
+    const tools = getSkewTools(profile);
+    return HAS_WRITE_KEYPAIR ? tools : tools.filter((tool) => isSkewReadOnlyTool(tool.name));
+}
+function getVisibleToolCountByProfile() {
+    const profiles = ["core", "trading", "rfq", "advanced", "governance", "all"];
+    const out = {};
+    for (const p of profiles)
+        out[p] = visibleToolsForProfile(p).length;
+    return out;
+}
+function hiddenWriteToolsForProfile(profile) {
+    if (HAS_WRITE_KEYPAIR)
+        return [];
+    return getSkewTools(profile)
+        .filter((tool) => !isSkewReadOnlyTool(tool.name))
+        .map((tool) => tool.name);
+}
+function agentGuideForJson() {
+    return {
+        first_calls: [
+            {
+                tool: "skew_get_signer_info",
+                reason: "Proves the active MCP signing posture before any write. Never assume a write wallet from chat context.",
+            },
+            {
+                tool: "skew_get_capabilities",
+                reason: "Reads the live protocol lanes, tenor policy, collateral rails, profile tool counts, and this agent guide.",
+            },
+        ],
+        signer_rules: [
+            "Each user runs their own MCP server with their own SKEW_KEYPAIR_PATH or KEYPAIR_PATH for local devnet writes.",
+            "Do not pack or reuse a shared omnibus private key for multiple users. Hosted mode must hide write tools.",
+            "Before any write, compare signer_pubkey from skew_get_signer_info with the user-intended wallet.",
+            "If write_tools_enabled=false, provide read-only analysis or unsigned SDK/API instructions; do not pretend a trade was sent.",
+        ],
+        lane_selection: {
+            instant_rfq_pm_backed: {
+                purpose: "Buyer wants real PM/CM-backed issuance now. This is the atomic_fill_from_relay lane and the path that records the seller CM short registry and margin delta.",
+                buyer_tools: ["skew_request_instant_rfq_quotes", "skew_hit_instant_rfq_quote"],
+                maker_tools: ["skew_serve_instant_rfq_mm_once"],
+                required_receipt: [
+                    "tx",
+                    "option_pda",
+                    "buyer_long_readback",
+                    "maker_short_readback",
+                    "pm_preflight_or_margin_receipt",
+                ],
+            },
+            auction_rfq_firm_tape: {
+                purpose: "Buyer opens an on-chain competition window and MMs post firm quotes. finalize_rfq_auction publishes/takes the tape and refunds auction escrow; it is not by itself an option mint.",
+                buyer_tools: ["skew_register_rfq_auction", "skew_finalize_rfq_auction"],
+                maker_tools: ["skew_submit_rfq_quote_direct", "skew_submit_rfq_quote"],
+                execution_tools: [
+                    "skew_request_instant_rfq_from_auction",
+                    "skew_hit_instant_rfq_from_auction_quote",
+                    "skew_create_option_from_rfq_quote",
+                    "skew_buy_option_from_rfq_quote",
+                ],
+            },
+            secondary_tape: {
+                purpose: "Discovery and receipt surface for existing option transfers. It is not an escrowed orderbook.",
+                seller_tools: ["skew_create_secondary_listing", "skew_transfer_option"],
+                buyer_tools: ["skew_list_secondary_listings", "skew_buy_secondary_listing"],
+                completion_rule: "A secondary trade is delivered only when skew_transfer_option returns readback_ok=true and the buyer appears as holder.",
+            },
+            pre_funded_legacy: {
+                purpose: "Simple fully collateralized issuance using create_option/buy_option. It is useful for demos and legacy primitives but does not show marginal PM capital efficiency.",
+                tools: ["skew_create_option", "skew_buy_option", "skew_settle_option"],
+            },
+        },
+        readback_rules: [
+            "Treat tx submission and product visibility as separate checks.",
+            "A successful issue/fill report must include tx, option_pda, option token mint when available, holder, creator, buyer-long readback, and maker-short or CM registry readback when PM-backed.",
+            "After secondary payment, report pending delivery until transfer_option readback proves the holder changed.",
+            "After Auction RFQ finalize, report firm tape/refund status unless a follow-up execution tool minted or transferred the option.",
+        ],
+        failure_posture: [
+            "If a tool returns an error, name the broken lifecycle state and next recovery tool. Do not switch lanes silently.",
+            "Do not use local scripts or smoke tests as proof of MCP product success.",
+            "Do not hide a missing signer, stale PDA, or missing readback behind a generic success message.",
+        ],
+    };
 }
 /**
  * Recursively coerce on-chain account snapshots to JSON-safe values.
@@ -180,6 +468,7 @@ const ASSET_INDEX = {
     XRP: 3,
     HYPE: 4,
 };
+const ASSET_BY_INDEX = ["BTC", "ETH", "SOL", "XRP", "HYPE"];
 function resolveAssetIdx(args) {
     const rawIdx = args["assetIdx"] ?? args["asset_idx"];
     if (rawIdx != null) {
@@ -209,6 +498,620 @@ function resolveSettlementMintArg(raw) {
     if (upper === "JITOSOL" || upper === "JITO")
         return JITOSOL_MINT;
     return new PublicKey(value);
+}
+function resolveInstantSettlement(raw) {
+    const value = raw == null || String(raw).trim() === "" ? "USDC" : String(raw).trim();
+    const upper = value.toUpperCase();
+    if (upper === "USDC") {
+        return { mint: new PublicKey(USDC_MINT), decimals: 6, label: "USDC" };
+    }
+    if (upper === "WSOL" || upper === "SOL") {
+        return { mint: NATIVE_SOL_MINT, decimals: 9, label: "wSOL" };
+    }
+    if (upper === "JITOSOL" || upper === "JITO") {
+        return { mint: JITOSOL_MINT, decimals: 9, label: "jitoSOL" };
+    }
+    return { mint: new PublicKey(value), decimals: Number(raw == null ? 6 : 6), label: "custom" };
+}
+function instantPayoffWire(payoff) {
+    if (payoff === "vanilla_call")
+        return { optionType: 0, direction: 1 };
+    if (payoff === "vanilla_put")
+        return { optionType: 0, direction: -1 };
+    if (payoff === "digital_call")
+        return { optionType: 1, direction: 1 };
+    if (payoff === "digital_put")
+        return { optionType: 1, direction: -1 };
+    if (payoff === "capped_call")
+        return { optionType: 2, direction: 1 };
+    if (payoff === "capped_put")
+        return { optionType: 2, direction: -1 };
+    if (payoff === "range_accrual")
+        return { optionType: 3, direction: 0 };
+    if (payoff === "vanilla_inverse_call")
+        return { optionType: 4, direction: 1 };
+    if (payoff === "vanilla_inverse_put")
+        return { optionType: 4, direction: -1 };
+    if (payoff === "digital_inverse_call")
+        return { optionType: 5, direction: 1 };
+    if (payoff === "digital_inverse_put")
+        return { optionType: 5, direction: -1 };
+    throw new Error(`Unsupported Instant RFQ payoff: ${payoff}`);
+}
+function instantPayoffFromAuctionSpec(optionType, direction) {
+    if (optionType === 0)
+        return direction < 0 ? "vanilla_put" : "vanilla_call";
+    if (optionType === 1)
+        return direction < 0 ? "digital_put" : "digital_call";
+    if (optionType === 2)
+        return direction < 0 ? "capped_put" : "capped_call";
+    if (optionType === 3)
+        return "range_accrual";
+    if (optionType === 4)
+        return direction < 0 ? "vanilla_inverse_put" : "vanilla_inverse_call";
+    if (optionType === 5)
+        return direction < 0 ? "digital_inverse_put" : "digital_inverse_call";
+    throw new Error(`Unsupported Auction RFQ option_type ${optionType}`);
+}
+function parseExpiryTs(args) {
+    const rawTs = args["expiry_ts"] ?? args["expiryTs"];
+    if (rawTs !== undefined && rawTs !== null && String(rawTs).trim() !== "") {
+        const n = BigInt(String(rawTs));
+        if (n <= 0n)
+            throw new Error("expiry_ts must be positive");
+        return n;
+    }
+    const raw = args["expiry"];
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+        throw new Error("expiry or expiry_ts is required");
+    }
+    const ms = new Date(String(raw)).getTime();
+    if (!Number.isFinite(ms))
+        throw new Error(`Invalid expiry: ${String(raw)}`);
+    return BigInt(Math.floor(ms / 1000));
+}
+function parsePremiumMicro(args) {
+    if (args["premium_micro"] !== undefined && args["premium_micro"] !== null) {
+        const n = BigInt(String(args["premium_micro"]));
+        if (n <= 0n)
+            throw new Error("premium_micro must be positive");
+        return n;
+    }
+    if (args["premium_usd"] !== undefined && args["premium_usd"] !== null) {
+        const n = usdToMicro(args["premium_usd"]);
+        if (n <= 0n)
+            throw new Error("premium_usd must be positive");
+        return n;
+    }
+    throw new Error("premium_micro or premium_usd is required");
+}
+function buildInstantSpecFromArgs(args) {
+    const underlying = String(args["underlying"]).toUpperCase();
+    const payoff = String(args["payoff"]);
+    const unsupported = unsupportedPayoffReason(underlying, payoff);
+    if (unsupported)
+        throw new Error(unsupported);
+    const asset = ASSET_INDEX[underlying];
+    if (asset === undefined)
+        throw new Error(`Unknown underlying: ${underlying}`);
+    const wire = instantPayoffWire(payoff);
+    const settlement = resolveInstantSettlement(args["settlement_mint"]);
+    const strikeUsd = Number(args["strike"]);
+    if (!Number.isFinite(strikeUsd) || strikeUsd <= 0) {
+        throw new Error("strike must be a positive USD number");
+    }
+    const notional = Number(args["notional"] ?? args["payoff_usd"]);
+    if (!Number.isFinite(notional) || notional <= 0) {
+        throw new Error("notional must be a positive number");
+    }
+    const maxPremiumUsdRaw = args["max_premium_usd"] ??
+        args["maxPremiumUsd"] ??
+        args["max_premium"] ??
+        null;
+    const maxPremiumUsd = maxPremiumUsdRaw === null || maxPremiumUsdRaw === undefined
+        ? null
+        : Number(maxPremiumUsdRaw);
+    if (maxPremiumUsd !== null && (!Number.isFinite(maxPremiumUsd) || maxPremiumUsd < 0)) {
+        throw new Error("max_premium_usd must be a non-negative number when provided");
+    }
+    const upperBoundUsd = Number(args["upper_bound_usd"] ?? args["upperBoundUsd"] ?? 0);
+    const extraParamInput = args["extra_param"] ?? args["extraParam"];
+    const strike = BigInt(Math.round(strikeUsd * 100_000_000));
+    const expiryTs = parseExpiryTs(args);
+    const payoffAmountMicro = BigInt(Math.round(notional * 1_000_000));
+    const maxPremiumMicro = maxPremiumUsd === null ? null : BigInt(Math.round(maxPremiumUsd * 1_000_000));
+    const upperBound = payoff === "range_accrual" || upperBoundUsd > 0
+        ? BigInt(Math.round(upperBoundUsd * 100_000_000))
+        : 0n;
+    const extraParam = payoff.startsWith("capped")
+        ? Number(extraParamInput ?? upperBoundUsd)
+        : Number(extraParamInput ?? 0);
+    if (payoff === "range_accrual" && upperBound <= strike) {
+        throw new Error("range_accrual requires upper_bound_usd greater than strike");
+    }
+    if (payoff.startsWith("capped") && (!Number.isFinite(extraParam) || extraParam <= 0)) {
+        throw new Error("capped_call/capped_put requires upper_bound_usd or extra_param cap strike");
+    }
+    const optionSpec = {
+        asset,
+        strike,
+        expiryTs,
+        payoffAmountMicro,
+        optionType: wire.optionType,
+        direction: wire.direction,
+        upperBound: payoff === "range_accrual" ? upperBound : 0n,
+        extraParam,
+    };
+    const request = {
+        asset,
+        option_type: wire.optionType,
+        direction: wire.direction,
+        strike: strike.toString(),
+        expiry_ts: expiryTs.toString(),
+        payoff_amount: payoffAmountMicro.toString(),
+        settlement_decimals: settlement.decimals,
+        upper_bound: optionSpec.upperBound.toString(),
+        extra_param: extraParam,
+        settlement_mint: settlement.mint.toBase58(),
+        underlying,
+        payoff,
+    };
+    if (maxPremiumMicro !== null) {
+        request["max_premium"] = maxPremiumMicro.toString();
+        request["max_premium_micro"] = maxPremiumMicro.toString();
+    }
+    const display = {
+        underlying,
+        payoff,
+        settlement: settlement.label,
+        settlement_mint: settlement.mint.toBase58(),
+        settlement_decimals: settlement.decimals,
+        strike_usd: strikeUsd,
+        expiry_ts: expiryTs.toString(),
+        expiry_iso: new Date(Number(expiryTs) * 1000).toISOString(),
+        notional,
+        max_premium_usd: maxPremiumUsd,
+        max_premium_micro: maxPremiumMicro?.toString() ?? null,
+        payoff_amount_micro: payoffAmountMicro.toString(),
+        option_type: wire.optionType,
+        direction: wire.direction,
+        upper_bound_usd: payoff === "range_accrual" ? upperBoundUsd : null,
+        extra_param: extraParam,
+    };
+    return { underlying, payoff, settlement, optionSpec, request, display };
+}
+function buildInstantSpecFromAuctionSnapshot(snap, args) {
+    const underlying = ASSET_BY_INDEX[snap.optionSpec.asset];
+    if (underlying === undefined) {
+        throw new Error(`Auction RFQ has unsupported asset index ${snap.optionSpec.asset}`);
+    }
+    const payoff = instantPayoffFromAuctionSpec(snap.optionSpec.optionType, snap.optionSpec.direction);
+    const strikeUsd = Number(snap.optionSpec.strike) / 100_000_000;
+    const expiryIso = new Date(Number(snap.optionSpec.expiryTs) * 1000).toISOString();
+    const notional = Number(snap.optionSpec.payoffAmountMicro) / 1_000_000;
+    const upperBoundUsd = snap.optionSpec.upperBound === 0n
+        ? undefined
+        : Number(snap.optionSpec.upperBound) / 100_000_000;
+    const premiumCapMicro = args["max_premium_micro"] != null
+        ? BigInt(String(args["max_premium_micro"]))
+        : snap.bestQuotePremiumMicro ?? snap.maxPremiumMicro;
+    const premiumCapUsd = Number(premiumCapMicro) / 1_000_000;
+    const settlementMint = args["settlement_mint"] ??
+        (snap.optionSpec.optionType === 4 || snap.optionSpec.optionType === 5 ? undefined : "USDC");
+    const derivedArgs = {
+        underlying,
+        payoff,
+        strike: strikeUsd,
+        expiry: expiryIso,
+        notional,
+        max_premium_usd: premiumCapUsd,
+        settlement_mint: settlementMint,
+    };
+    if (upperBoundUsd !== undefined) {
+        derivedArgs["upper_bound_usd"] = upperBoundUsd;
+        derivedArgs["extra_param"] = upperBoundUsd;
+    }
+    return buildInstantSpecFromArgs(derivedArgs);
+}
+async function executeInstantRfqHit(args) {
+    const preMakerCm = await args.skew.fetchClearingMember(args.cmPubkey);
+    const preBuyerPortfolio = await args.skew.getPortfolio(args.buyer);
+    const seriesPrerequisite = await ensureInstantSeriesListed(args.skew, args.built);
+    const payload = buildRelayPayload({
+        relayNonce: args.relayNonce,
+        optionSpec: args.built.optionSpec,
+        premiumMicro: args.premiumMicro,
+        settlementMint: args.built.settlement.mint,
+        settlementDecimals: args.built.settlement.decimals,
+        quoteExpiryTs: BigInt(Math.floor(Date.now() / 1000) + args.quoteExpirySeconds),
+        buyer: args.buyer,
+    });
+    const result = await hitInstantRfqQuoteTxSigned({
+        buyer: args.buyer,
+        cmPubkey: args.cmPubkey,
+        payload,
+        relayUrl: args.relayUrl,
+        timeoutMs: args.timeoutMs,
+        signTransaction: signWithConfiguredKeypair,
+    });
+    let option = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const options = await args.skew.listOptions({ pda: result.optionPda }).catch(() => []);
+        if (options.length > 0) {
+            option = optionSummaryForJson(options[0]);
+            break;
+        }
+        await sleep(500);
+    }
+    const [postMakerCm, postBuyerPortfolio, postMakerPortfolio] = await Promise.all([
+        args.skew.fetchClearingMember(args.cmPubkey),
+        args.skew.getPortfolio(args.buyer),
+        args.skew.getPortfolio(args.cmPubkey),
+    ]);
+    const optionPda = result.optionPda;
+    const buyerHasLong = postBuyerPortfolio.longOptions.some((s) => s.pda === optionPda);
+    const makerHasShort = postMakerPortfolio.shortOptions.some((s) => s.pda === optionPda);
+    const readbackErrors = [];
+    if (option === null) {
+        readbackErrors.push("option PDA was not readable after fill");
+    }
+    else {
+        if (option["holder"] !== args.buyer.toBase58()) {
+            readbackErrors.push(`option holder mismatch: expected buyer ${args.buyer.toBase58()}, got ${String(option["holder"])}`);
+        }
+        if (option["creator"] !== args.cmPubkey.toBase58()) {
+            readbackErrors.push(`option creator mismatch: expected maker ${args.cmPubkey.toBase58()}, got ${String(option["creator"])}`);
+        }
+    }
+    if (!buyerHasLong) {
+        readbackErrors.push("buyer portfolio long_options does not include the filled option PDA");
+    }
+    if (!makerHasShort) {
+        readbackErrors.push("maker portfolio short_options does not include the filled option PDA");
+    }
+    const prePositions = preMakerCm?.positionsCount ?? null;
+    const postPositions = postMakerCm?.positionsCount ?? null;
+    if (prePositions !== null &&
+        postPositions !== null &&
+        postPositions < prePositions + 1) {
+        readbackErrors.push(`maker CM positions_count did not increase by at least one: before=${prePositions}, after=${postPositions}`);
+    }
+    const preLocked = preMakerCm?.totalPmLockedMicro ?? 0n;
+    const postLocked = postMakerCm?.totalPmLockedMicro ?? 0n;
+    const lockedDelta = postLocked >= preLocked ? postLocked - preLocked : 0n;
+    const notionalMicro = args.built.optionSpec.payoffAmountMicro;
+    return {
+        success: true,
+        readback_ok: readbackErrors.length === 0,
+        readback_errors: readbackErrors,
+        execution_lane: "instant_rfq_atomic_fill",
+        collateral_model: "portfolio_margin_delta_im",
+        origin: args.origin ?? null,
+        tx_signature: result.txSignature,
+        explorer: `https://explorer.solana.com/tx/${result.txSignature}?cluster=devnet`,
+        relay_nonce: result.relayNonce.toString(),
+        option_pda: result.optionPda,
+        simulated_units: result.simulatedUnits ?? null,
+        premium_destination: result.premiumDestination ?? null,
+        auto_prepared_accounts: result.autoPreparedAccounts ?? [],
+        request: args.built.display,
+        series_prerequisite: seriesPrerequisite,
+        selected_quote: {
+            cm_pubkey: args.cmPubkey.toBase58(),
+            premium_micro: args.premiumMicro.toString(),
+            premium_usd: Number(args.premiumMicro) / 1_000_000,
+        },
+        pm_risk_preflight: riskPreflightForJson(result.riskPreflight),
+        pm_lock_readback: {
+            notional_micro: notionalMicro.toString(),
+            notional_usd: microToUsdNumber(notionalMicro),
+            pre_total_pm_locked_micro: preLocked.toString(),
+            pre_total_pm_locked_usd: microToUsdNumber(preLocked),
+            post_total_pm_locked_micro: postLocked.toString(),
+            post_total_pm_locked_usd: microToUsdNumber(postLocked),
+            observed_locked_delta_micro: lockedDelta.toString(),
+            observed_locked_delta_usd: microToUsdNumber(lockedDelta),
+            observed_locked_delta_pct_of_notional: microPercentOf(lockedDelta, notionalMicro),
+            pre_positions_count: prePositions,
+            post_positions_count: postPositions,
+            post_last_im_micro: postMakerCm?.lastImMicro?.toString() ?? null,
+            post_last_im_usd: postMakerCm?.lastImMicro === undefined
+                ? null
+                : microToUsdNumber(postMakerCm.lastImMicro),
+            post_last_im_pct_of_notional: postMakerCm?.lastImMicro === undefined
+                ? null
+                : microPercentOf(postMakerCm.lastImMicro, notionalMicro),
+        },
+        option,
+        buyer_portfolio_counts: {
+            before_total: preBuyerPortfolio.options.length,
+            after_total: postBuyerPortfolio.options.length,
+            after_long: postBuyerPortfolio.longOptions.length,
+            after_short: postBuyerPortfolio.shortOptions.length,
+            contains_filled_long: buyerHasLong,
+        },
+        maker_portfolio_counts: {
+            after_total: postMakerPortfolio.options.length,
+            after_long: postMakerPortfolio.longOptions.length,
+            after_short: postMakerPortfolio.shortOptions.length,
+            contains_filled_short: makerHasShort,
+        },
+        readback_steps: [
+            { tool: "skew_list_options", arguments: { filter_option_pda: result.optionPda } },
+            { tool: "skew_fetch_portfolio", arguments: { owner: args.buyer.toBase58() } },
+            { tool: "skew_fetch_portfolio", arguments: { owner: args.cmPubkey.toBase58() } },
+            {
+                tool: "skew_fetch_clearing_member",
+                arguments: { authority: args.cmPubkey.toBase58() },
+            },
+        ],
+        proof: "PM-backed success requires tx + option readback + buyer long + maker short + CM registry/positions_count readback, not tx alone.",
+    };
+}
+function relayUrlFromArgs(args) {
+    const raw = args["relay_url"] ?? process.env["SKEW_RELAY_URL"];
+    if (typeof raw === "string" && raw.trim().length > 0)
+        return raw.trim();
+    return INSTANT_RFQ_DEFAULT_RELAY_URL;
+}
+function microToUsdNumber(value) {
+    if (value === undefined)
+        return null;
+    return Number(value) / 1_000_000;
+}
+function microPercentOf(value, denominator) {
+    if (value === undefined || denominator === undefined || denominator <= 0n)
+        return null;
+    return Number(value) / Number(denominator) * 100;
+}
+function sleep(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
+function riskPreflightForJson(risk) {
+    if (!risk)
+        return null;
+    return {
+        status: risk.status ?? null,
+        pre_im_micro: risk.preImMicro?.toString() ?? null,
+        pre_im_usd: microToUsdNumber(risk.preImMicro),
+        post_im_micro: risk.postImMicro?.toString() ?? null,
+        post_im_usd: microToUsdNumber(risk.postImMicro),
+        required_delta_micro: risk.requiredDeltaMicro?.toString() ?? null,
+        required_delta_usd: microToUsdNumber(risk.requiredDeltaMicro),
+        marginal_im_locked_micro: risk.marginalImLockedMicro?.toString() ?? null,
+        marginal_im_locked_usd: microToUsdNumber(risk.marginalImLockedMicro),
+        free_collateral_micro: risk.freeCollateralMicro?.toString() ?? null,
+        free_collateral_usd: microToUsdNumber(risk.freeCollateralMicro),
+        after_fill_free_micro: risk.afterFillFreeMicro?.toString() ?? null,
+        after_fill_free_usd: microToUsdNumber(risk.afterFillFreeMicro),
+        health_before_bps: risk.healthBeforeBps?.toString() ?? null,
+        health_after_bps: risk.healthAfterBps?.toString() ?? null,
+        fee_micro: risk.feeMicro?.toString() ?? null,
+        fee_usd: microToUsdNumber(risk.feeMicro),
+        premium_micro: risk.premiumMicro?.toString() ?? null,
+        premium_usd: microToUsdNumber(risk.premiumMicro),
+        mmp: risk.mmp ?? null,
+        position_accounts: risk.positionAccounts ?? null,
+    };
+}
+async function signWithConfiguredKeypair(transaction) {
+    const keypair = loadWriteKeypair();
+    if (transaction instanceof VersionedTransaction) {
+        transaction.sign([keypair]);
+        return transaction;
+    }
+    transaction.partialSign(keypair);
+    return transaction;
+}
+function openRelayWs(url) {
+    const ctor = globalThis.WebSocket;
+    if (ctor === undefined) {
+        throw new Error("Node runtime does not expose global WebSocket; run MCP on Node 20+ or 22+.");
+    }
+    return new ctor(url);
+}
+function readWsText(data) {
+    if (typeof data === "string")
+        return data;
+    if (data instanceof ArrayBuffer)
+        return new TextDecoder().decode(data);
+    if (ArrayBuffer.isView(data)) {
+        return new TextDecoder().decode(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    }
+    if (Buffer.isBuffer(data))
+        return data.toString("utf8");
+    return String(data);
+}
+function parseRelayMessage(data) {
+    return JSON.parse(readWsText(data));
+}
+function payloadMatchesFilter(msg, filterUnderlying, filterPayoff) {
+    if (filterUnderlying !== null) {
+        const asset = Number(msg["asset"] ?? -1);
+        if (ASSET_INDEX[filterUnderlying] !== asset)
+            return false;
+    }
+    if (filterPayoff !== null) {
+        const wire = instantPayoffWire(filterPayoff);
+        if (Number(msg["option_type"] ?? -1) !== wire.optionType)
+            return false;
+        if (Number(msg["direction"] ?? -99) !== wire.direction)
+            return false;
+    }
+    return true;
+}
+async function prepareInstantMaker(skew, initialCollateralUsdc, pmCacheUnderlying) {
+    const authority = skew.walletPublicKey;
+    const actions = [];
+    const before = await skew.fetchClearingMember(authority);
+    if (before === null) {
+        const registered = await skew.registerClearingMember({ initialCollateralUsdc });
+        actions.push({
+            action: "register_clearing_member",
+            tx_signature: registered.txSignature,
+            cm_pda: registered.cmPda.toBase58(),
+        });
+    }
+    else {
+        actions.push({
+            action: "register_clearing_member",
+            skipped: true,
+            reason: "already_registered",
+            positions_count: before.positionsCount,
+            collateral_micro: before.collateralMicro.toString(),
+        });
+    }
+    try {
+        const vt = await skew.initVolumeTracker();
+        actions.push({
+            action: "init_volume_tracker",
+            tx_signature: vt.txSignature,
+            volume_tracker: vt.volumeTracker.toBase58(),
+        });
+    }
+    catch (e) {
+        actions.push({
+            action: "init_volume_tracker",
+            skipped: true,
+            reason: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
+        });
+    }
+    try {
+        const maker = await skew.registerRfqMaker();
+        actions.push({
+            action: "register_rfq_maker",
+            tx_signature: maker.txSignature,
+            registry_pda: maker.registry.toBase58(),
+        });
+    }
+    catch (e) {
+        actions.push({
+            action: "register_rfq_maker",
+            failed: true,
+            reason: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
+        });
+        throw e;
+    }
+    try {
+        const refresh = skew.refreshPmCacheFull;
+        if (refresh) {
+            const [cache, cmForCache] = await Promise.all([
+                skew.fetchPmCache(authority).catch(() => null),
+                skew.fetchClearingMember(authority),
+            ]);
+            const positionsCount = cmForCache?.positionsCount ?? 0;
+            const cacheFresh = cache !== null &&
+                cache.initialized &&
+                !cache.dirty &&
+                cache.registryCount === positionsCount;
+            if (cacheFresh) {
+                actions.push({
+                    action: "refresh_pm_cache_full",
+                    skipped: true,
+                    reason: "cache already clean and registry_count matches positions_count",
+                    registry_count: cache.registryCount,
+                    positions_count: positionsCount,
+                });
+            }
+            else {
+                const { price: spot } = await fetchSpot(pmCacheUnderlying);
+                const refreshed = await refresh.call(skew, spot);
+                actions.push({
+                    action: "refresh_pm_cache_full",
+                    underlying: pmCacheUnderlying,
+                    current_spot_usd: spot,
+                    previous_cache: cache === null ? null : serializeJson(cache),
+                    result: serializeJson(refreshed),
+                });
+            }
+        }
+        else {
+            actions.push({
+                action: "refresh_pm_cache_full",
+                skipped: true,
+                reason: "SDK does not expose refreshPmCacheFull",
+            });
+        }
+    }
+    catch (e) {
+        actions.push({
+            action: "refresh_pm_cache_full",
+            failed: true,
+            reason: e instanceof Error ? e.message.slice(0, 240) : String(e).slice(0, 240),
+        });
+    }
+    const after = await skew.fetchClearingMember(authority);
+    return {
+        authority: authority.toBase58(),
+        actions,
+        clearing_member: after
+            ? {
+                positions_count: after.positionsCount,
+                collateral_micro: after.collateralMicro.toString(),
+                total_pm_locked_micro: after.totalPmLockedMicro.toString(),
+                last_im_micro: after.lastImMicro.toString(),
+                free_collateral_micro: after.freeCollateralMicro.toString(),
+            }
+            : null,
+    };
+}
+function optionTypeNameFromWire(optionType) {
+    if (optionType === 0)
+        return "Vanilla";
+    if (optionType === 1)
+        return "Digital";
+    if (optionType === 2)
+        return "CappedVanilla";
+    if (optionType === 3)
+        return "RangeAccrual";
+    if (optionType === 4)
+        return "VanillaInverse";
+    if (optionType === 5)
+        return "DigitalInverse";
+    throw new Error(`Unknown Instant RFQ option_type ${optionType}`);
+}
+async function ensureInstantSeriesListed(skew, built) {
+    const optionTypeName = optionTypeNameFromWire(built.optionSpec.optionType);
+    const direction = built.optionSpec.direction;
+    const [series] = findSeriesListingPda(built.optionSpec.asset, built.optionSpec.strike, built.optionSpec.expiryTs, built.optionSpec.optionType, direction);
+    const connection = new Connection(RPC_URL, "confirmed");
+    const existing = await connection.getAccountInfo(series, "confirmed");
+    if (existing !== null) {
+        return {
+            status: "already_listed",
+            series_pda: series.toBase58(),
+            account_size: existing.data.length,
+        };
+    }
+    try {
+        const listed = await skew.listSeries({
+            asset: built.optionSpec.asset,
+            strikeMicro: built.optionSpec.strike,
+            expiryTs: built.optionSpec.expiryTs,
+            optionTypeName,
+            direction,
+        });
+        return {
+            status: "listed",
+            series_pda: listed.series.toBase58(),
+            tx_signature: listed.txSignature,
+        };
+    }
+    catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const after = await connection.getAccountInfo(series, "confirmed");
+        if (after !== null) {
+            return {
+                status: "listed_by_race",
+                series_pda: series.toBase58(),
+                account_size: after.data.length,
+                recovered_from: message.slice(0, 240),
+            };
+        }
+        throw new Error(`list_series prerequisite failed for Instant RFQ: ${message}`);
+    }
 }
 async function fetchPovsState(underlying, conn) {
     const idx = ASSET_INDEX[underlying];
@@ -360,21 +1263,63 @@ function allowlistFairValue(input) {
 // ---------------------------------------------------------------------------
 // MCP Server setup
 // ---------------------------------------------------------------------------
-const server = new Server({ name: "skew", version: "0.6.2" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "skew", version: MCP_SERVER_VERSION }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: ACTIVE_TOOLS,
 }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const a = (args ?? {});
+    const disabledReason = getSkewDisabledToolReason(name);
+    if (disabledReason) {
+        return typedErr("ToolDisabled", disabledReason, {
+            tool: name,
+            activeProfile: MCP_PROFILE,
+        });
+    }
     if (!ACTIVE_TOOL_NAMES.has(name)) {
-        return err(`${name} is not exposed by SKEW_MCP_PROFILE=${MCP_PROFILE}. Use SKEW_MCP_PROFILE=advanced, governance, or all only when that wider surface is intentional.`);
+        if (PROFILE_TOOL_NAMES.has(name) && !HAS_WRITE_KEYPAIR && !isSkewReadOnlyTool(name)) {
+            return typedErr("WriteKeyRequired", "This write tool is in the selected MCP profile but is hidden until a devnet write keypair is configured.", {
+                tool: name,
+                activeProfile: MCP_PROFILE,
+                requiredEnv: ["SKEW_KEYPAIR_PATH", "KEYPAIR_PATH", "SKEW_PRIVATE_KEY"],
+            });
+        }
+        return typedErr("ToolNotInProfile", `${name} is not exposed by SKEW_MCP_PROFILE=${MCP_PROFILE}. Use SKEW_MCP_PROFILE=advanced, governance, or all only when that wider surface is intentional.`, {
+            tool: name,
+            activeProfile: MCP_PROFILE,
+        });
     }
     try {
         switch (name) {
             // -----------------------------------------------------------------------
             case "skew_get_capabilities": {
-                return ok(JSON.stringify(getSkewCapabilities(), null, 2));
+                // W32-E (F-4 / F-8): enrich the SDK capability payload with
+                // MCP-side metadata — the static MCP-tool ↔ pricing-route table and
+                // the visible-tool count for each profile. SDK callers that don't
+                // need the MCP introspection block can ignore the extra keys.
+                const base = getSkewCapabilities();
+                const enriched = {
+                    ...base,
+                    mcp: {
+                        activeProfile: MCP_PROFILE,
+                        hasWriteKeypair: HAS_WRITE_KEYPAIR,
+                        signing: signerInfoForJson(false),
+                        activeToolCount: ACTIVE_TOOLS.length,
+                        profileToolCount: PROFILE_TOOLS.length,
+                        hiddenWriteTools: hiddenWriteToolsForProfile(MCP_PROFILE),
+                        pricingBaseUrl: PRICING_URL,
+                        pricingToolRoutes: MCP_PRICING_TOOL_ROUTE_MAP,
+                        toolCountByProfile: getVisibleToolCountByProfile(),
+                        profileToolCountByProfile: getProfileToolCountByProfile(),
+                        agentGuide: agentGuideForJson(),
+                    },
+                };
+                return ok(JSON.stringify(enriched, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_get_signer_info": {
+                return ok(JSON.stringify(signerInfoForJson(true), null, 2));
             }
             // -----------------------------------------------------------------------
             case "skew_get_spot": {
@@ -438,12 +1383,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // -----------------------------------------------------------------------
             case "skew_list_options": {
                 const limit = Math.min(Number(a["limit"] ?? 10), 50);
+                const filterOptionPda = typeof a["filter_option_pda"] === "string" ? String(a["filter_option_pda"]) : undefined;
+                const holder = typeof a["holder"] === "string" ? String(a["holder"]) : undefined;
+                const creator = typeof a["creator"] === "string" ? String(a["creator"]) : undefined;
                 const underlying = a["underlying"];
                 const optionType = a["option_type"];
                 const state = a["state"];
                 const sortBy = a["sort_by"] ?? "createdAt";
                 const skew = await getReadOnlySkewClient();
                 const summaries = await skew.listOptions({
+                    pda: filterOptionPda,
+                    holder,
+                    creator,
                     underlying,
                     optionType,
                     state,
@@ -454,27 +1405,204 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     count: summaries.length,
                     program: SKEW_PROGRAM_ID.toBase58(),
                     rpc: RPC_URL,
-                    filters: { underlying, option_type: optionType, state, sort_by: sortBy },
-                    options: summaries.map((s) => ({
+                    filters: {
+                        filter_option_pda: filterOptionPda,
+                        holder,
+                        creator,
+                        underlying,
+                        option_type: optionType,
+                        state,
+                        sort_by: sortBy,
+                    },
+                    options: summaries.map((s) => optionSummaryForJson(s)),
+                }, null, 2));
+            }
+            case "skew_fetch_portfolio": {
+                const owner = await authorityFromArgs(a, "owner");
+                const skew = await getReadOnlySkewClient();
+                const portfolio = await skew.getPortfolio(new PublicKey(owner));
+                return ok(JSON.stringify({
+                    success: true,
+                    owner: portfolio.owner,
+                    long_count: portfolio.longOptions.length,
+                    short_count: portfolio.shortOptions.length,
+                    option_count: portfolio.options.length,
+                    clearing_member: portfolio.clearingMember
+                        ? {
+                            registered: true,
+                            collateral_usdc: Number(portfolio.clearingMember.collateralMicro) / 1e6,
+                            free_collateral_usdc: Number(portfolio.clearingMember.freeCollateralMicro) / 1e6,
+                            total_pm_locked_usdc: Number(portfolio.clearingMember.totalPmLockedMicro) / 1e6,
+                            last_im_usdc: Number(portfolio.clearingMember.lastImMicro) / 1e6,
+                            positions_count: portfolio.clearingMember.positionsCount,
+                            last_margin_check_unix: portfolio.clearingMember.lastMarginCheck.toString(),
+                        }
+                        : { registered: false },
+                    long_options: portfolio.longOptions.map((s) => ({
                         pda: s.pda,
+                        option_token_mint: s.optionTokenMint,
                         creator: s.creator,
                         holder: s.holder,
-                        option_type: s.optionType,
                         state: s.state,
                         underlying: s.underlying,
+                        option_type: s.optionType,
                         direction: s.direction,
                         strike_usd: s.strikeUsd,
-                        upper_bound_usd: s.upperBoundUsd,
-                        expiry_ts: s.expiryTs,
                         expiry_iso: new Date(s.expiryTs * 1000).toISOString(),
                         payoff_usd: s.payoffUsd,
-                        collateral_locked_usd: s.collateralLockedUsd,
-                        v0_usd: s.v0Usd,
-                        sigma_at_creation: s.sigmaAtCreation,
-                        spot_at_creation_usd: s.spotAtCreationUsd,
-                        settled: s.settled,
-                        created_at: s.createdAt,
+                        settlement_mint: s.settlementMint,
+                        metadata_status: s.metadataStatus,
                     })),
+                    short_options: portfolio.shortOptions.map((s) => ({
+                        pda: s.pda,
+                        option_token_mint: s.optionTokenMint,
+                        creator: s.creator,
+                        holder: s.holder,
+                        state: s.state,
+                        underlying: s.underlying,
+                        option_type: s.optionType,
+                        direction: s.direction,
+                        strike_usd: s.strikeUsd,
+                        expiry_iso: new Date(s.expiryTs * 1000).toISOString(),
+                        payoff_usd: s.payoffUsd,
+                        settlement_mint: s.settlementMint,
+                        metadata_status: s.metadataStatus,
+                    })),
+                    options: portfolio.options.map((s) => optionSummaryForJson(s)),
+                }, null, 2));
+            }
+            case "skew_list_rfq_auctions": {
+                const limit = Math.min(Number(a["limit"] ?? 25), 100);
+                const underlying = a["underlying"];
+                const buyer = typeof a["buyer"] === "string" ? String(a["buyer"]) : undefined;
+                const withQuote = typeof a["with_quote"] === "boolean" ? Boolean(a["with_quote"]) : undefined;
+                const source = a["source"];
+                const skew = await getReadOnlySkewClient();
+                const tape = await skew.listRfqAuctions({
+                    webUrl: WEB_URL,
+                    buyer,
+                    asset: underlying,
+                    withQuote,
+                    source,
+                    limit,
+                });
+                return ok(JSON.stringify({
+                    ...tape,
+                    filters: {
+                        buyer,
+                        underlying,
+                        with_quote: withQuote ?? false,
+                        source: source ?? "terminal_default",
+                        limit,
+                    },
+                    note: "This is the RFQ discovery tape. Use skew_fetch_rfq_auction with an auction PDA for exact on-chain state, then quote/finalize through the RFQ profile.",
+                }, null, 2));
+            }
+            case "skew_list_secondary_listings": {
+                const limit = Math.min(Number(a["limit"] ?? 25), 100);
+                const underlying = a["underlying"];
+                const active = typeof a["active"] === "boolean" ? Boolean(a["active"]) : undefined;
+                const pending = typeof a["pending"] === "boolean" ? Boolean(a["pending"]) : undefined;
+                const seller = typeof a["seller"] === "string" ? String(a["seller"]) : undefined;
+                const optionPda = typeof a["option_pda"] === "string" ? String(a["option_pda"]) : undefined;
+                const minQty = a["min_qty"] === undefined ? undefined : Number(a["min_qty"]);
+                const maxAsk = a["max_ask_usdc"] === undefined ? undefined : Number(a["max_ask_usdc"]);
+                const excludeMe = typeof a["exclude_me"] === "string" ? String(a["exclude_me"]) : undefined;
+                const skew = await getReadOnlySkewClient();
+                const tape = await skew.listSecondaryListings({
+                    webUrl: WEB_URL,
+                    asset: underlying,
+                    active,
+                    pending,
+                    seller,
+                    optionPda,
+                    minQty,
+                    maxAsk,
+                    excludeMe,
+                    limit,
+                });
+                return ok(JSON.stringify({
+                    ...tape,
+                    filters: {
+                        underlying,
+                        active: active ?? true,
+                        pending,
+                        seller,
+                        option_pda: optionPda,
+                        min_qty: minQty,
+                        max_ask_usdc: maxAsk,
+                        exclude_me: excludeMe,
+                        limit,
+                    },
+                    note: "This is the secondary discovery tape. Execution is intentionally separate: use SDK/MCP/API trading calls with a wallet/keypair for buy or delist flows.",
+                }, null, 2));
+            }
+            case "skew_create_secondary_listing": {
+                const skew = await getSkewClient();
+                const optionAddress = String(a["option_address"]);
+                const result = await skew.createSecondaryListing({
+                    webUrl: WEB_URL,
+                    optionPda: optionAddress,
+                    optionTokenMint: typeof a["option_token_mint"] === "string"
+                        ? String(a["option_token_mint"])
+                        : undefined,
+                    askPriceUsdc: Number(a["ask_price_usdc"]),
+                    tokenAmount: a["token_amount"] === undefined ? undefined : Number(a["token_amount"]),
+                    durationHours: a["duration_hours"] === undefined ? undefined : Number(a["duration_hours"]),
+                    sellerHandle: typeof a["seller_handle"] === "string" ? String(a["seller_handle"]) : null,
+                });
+                const tape = await skew.listSecondaryListings({
+                    webUrl: WEB_URL,
+                    optionPda: optionAddress,
+                    active: true,
+                    limit: 10,
+                });
+                const optionReadback = optionSummaryForJson(result.option_readback);
+                return ok(JSON.stringify({
+                    success: result.success,
+                    listing: result.listing,
+                    option_pda: result.option_pda,
+                    option_token_mint: result.option_token_mint,
+                    seller: result.seller,
+                    ask_price_usdc: result.ask_price_usdc,
+                    token_amount: result.token_amount,
+                    holder_verified: result.holder_verified,
+                    option_readback: optionReadback,
+                    tape_readback: tape,
+                    next_step: "Buyer can call skew_buy_secondary_listing to pay and stamp a buy intent. Seller must then call skew_transfer_option(option_address, new_holder=buyer) to complete delivery.",
+                }, null, 2));
+            }
+            case "skew_buy_secondary_listing": {
+                const skew = await getSkewClient();
+                const listingId = String(a["listing_id"]);
+                const listingJson = await skewWebJson(`/api/listings/${encodeURIComponent(listingId)}`);
+                const listing = listingJson.listing;
+                if (listing === undefined || listing === null) {
+                    return err(`secondary listing not found: ${listingId}`);
+                }
+                const listingOption = String(listing["option_pda"] ?? "");
+                const listingSeller = String(listing["seller"] ?? "");
+                const listingAsk = Number(listing["ask_price_usdc"]);
+                if (!listingOption || !listingSeller || !Number.isFinite(listingAsk) || listingAsk <= 0) {
+                    return err(`secondary listing ${listingId} is missing option/seller/ask fields`);
+                }
+                const result = await skew.buySecondaryListing({
+                    webUrl: WEB_URL,
+                    listingId,
+                    optionPda: typeof a["option_address"] === "string" ? String(a["option_address"]) : listingOption,
+                    seller: typeof a["seller"] === "string" ? String(a["seller"]) : listingSeller,
+                    askPriceUsdc: a["ask_price_usdc"] === undefined ? listingAsk : Number(a["ask_price_usdc"]),
+                });
+                return ok(JSON.stringify({
+                    ...result,
+                    delivery_step: {
+                        tool: "skew_transfer_option",
+                        args: {
+                            option_address: result.option_pda,
+                            new_holder: result.buyer,
+                        },
+                        signer: "seller/current holder MCP process",
+                    },
                 }, null, 2));
             }
             // -----------------------------------------------------------------------
@@ -703,16 +1831,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
             // ── Phase 57301 (2026-05-04) — OTC primitives ──────────────────────
             case "skew_take_best_quote": {
-                return err("take_best_quote is not in the current skew_master IDL. Use the Instant RFQ relay lane for click-to-fill, or skew_finalize_rfq_auction after close_slot for the Auction RFQ lane. Instant RFQ requires buyer_tx_signed because atomic_fill_from_relay has buyer: Signer.");
+                const skew = await getSkewClient();
+                if (a["expected_premium_micro"] == null && a["expected_premium_usd"] == null) {
+                    return err("expected_premium_micro or expected_premium_usd is required as a price-move guard");
+                }
+                const expectedPremiumMicro = a["expected_premium_micro"] != null
+                    ? BigInt(String(a["expected_premium_micro"]))
+                    : BigInt(Math.round(Number(a["expected_premium_usd"]) * 1_000_000));
+                const r = await skew.takeBestQuote({
+                    auction: new PublicKey(String(a["auction_pda"])),
+                    expectedPremiumMicro,
+                });
+                return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
             }
             case "skew_refresh_quote": {
-                return err("refresh_quote is not in the current skew_master IDL. Use skew_submit_rfq_quote with a fresh signed quote.");
+                const skew = await getSkewClient();
+                const sigRaw = String(a["mm_signature_b64"]);
+                const sigBytes = bs58.decode(sigRaw);
+                const r = await skew.refreshQuote({
+                    auction: new PublicKey(String(a["auction_pda"])),
+                    premiumMicro: BigInt(Math.round(Number(a["premium_usd"]) * 1_000_000)),
+                    validUntilSlot: BigInt(String(a["valid_until_slot"])),
+                    mmSignature: sigBytes,
+                });
+                return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
             }
             case "skew_publish_axe": {
-                return err("publish_axe is not in the current skew_master IDL.");
+                const skew = await getSkewClient();
+                const r = await skew.publishAxe(axeFieldsFromArgs(a));
+                return ok(JSON.stringify({ success: true, axe_pda: r.axe.toBase58(), tx_signature: r.txSignature }, null, 2));
+            }
+            case "skew_update_axe": {
+                const skew = await getSkewClient();
+                const r = await skew.updateAxe({
+                    axe: new PublicKey(String(a["axe_pda"])),
+                    fields: axeFieldsFromArgs(a),
+                });
+                return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
             }
             case "skew_revoke_axe": {
-                return err("revoke_axe is not in the current skew_master IDL.");
+                const skew = await getSkewClient();
+                const r = await skew.revokeAxe(new PublicKey(String(a["axe_pda"])));
+                return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
             }
             // -----------------------------------------------------------------------
             case "skew_create_option": {
@@ -776,13 +1936,580 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     note: "This is runtime deployment state. get_capabilities reports protocol support; this allowlist decides whether a mint is accepted by live custody instructions.",
                 }, null, 2));
             }
-            // -----------------------------------------------------------------------
-            case "skew_buy_option": {
+            case "skew_fetch_pm_cache": {
+                const authority = await authorityFromArgs(a, "cm_authority");
+                const json = await skewWebJson(`/api/cm/${authority}/pm-cache`);
+                return ok(JSON.stringify(json, null, 2));
+            }
+            case "skew_preview_incremental_margin": {
+                const authority = await authorityFromArgs(a, "cm_authority");
+                const body = {};
+                if (a["estimated_post_im_micro"] != null) {
+                    body["estimated_post_im_micro"] = String(a["estimated_post_im_micro"]);
+                }
+                const json = await skewWebJson(`/api/cm/${authority}/margin-preview`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                });
+                return ok(JSON.stringify(json, null, 2));
+            }
+            case "skew_list_rent_reclaimable": {
+                const authority = await authorityFromArgs(a, "authority");
+                const json = await skewWebJson(`/api/rent-reclaim?authority=${authority}`);
+                return ok(JSON.stringify(json, null, 2));
+            }
+            case "skew_list_rfq_quotes": {
+                const auction = new PublicKey(String(a["auction"])).toBase58();
+                const limit = Math.min(Math.max(Number(a["limit"] ?? 50), 1), 100);
+                const json = await skewWebJson(`/api/rfq-auctions/${encodeURIComponent(auction)}/quotes?limit=${limit}`);
+                if (typeof json === "object" &&
+                    json !== null &&
+                    Number(json["count"] ?? 0) === 0) {
+                    const skew = await getReadOnlySkewClient();
+                    const snap = await skew.fetchRfqAuction(new PublicKey(auction));
+                    if (snap?.bestQuoteMm != null &&
+                        snap.bestQuotePremiumMicro != null &&
+                        snap.bestQuoteValidUntilSlot != null) {
+                        const premiumMicro = snap.bestQuotePremiumMicro.toString();
+                        return ok(JSON.stringify({
+                            ...json,
+                            count: 1,
+                            firm_count: 1,
+                            best_premium_usdc: Number(snap.bestQuotePremiumMicro) / 1_000_000,
+                            worst_premium_usdc: Number(snap.bestQuotePremiumMicro) / 1_000_000,
+                            spread_usdc: 0,
+                            unique_mms: 1,
+                            quotes: [
+                                {
+                                    auction,
+                                    mm: snap.bestQuoteMm.toBase58(),
+                                    premium_micro: premiumMicro,
+                                    premium_usdc: Number(snap.bestQuotePremiumMicro) / 1_000_000,
+                                    valid_until_slot: snap.bestQuoteValidUntilSlot.toString(),
+                                    quote_type: "firm",
+                                    source: "onchain_best_quote_fallback",
+                                },
+                            ],
+                            source: "indexer+onchain_best_quote_fallback",
+                            note: "Indexer quote-depth returned no rows; MCP recovered the current firm best quote from the on-chain RfqAuctionPda.",
+                        }, null, 2));
+                    }
+                }
+                return ok(JSON.stringify(json, null, 2));
+            }
+            case "skew_request_instant_rfq_from_auction": {
                 const skew = await getSkewClient();
-                const result = await skew.buy(String(a["option_address"]), Number(a["premium_usd"]));
+                const buyer = skew.walletPublicKey;
+                const auctionPda = new PublicKey(String(a["auction"]));
+                const snap = await skew.fetchRfqAuction(auctionPda);
+                if (snap === null) {
+                    return err(`RFQ auction not found: ${auctionPda.toBase58()}`);
+                }
+                if (!snap.buyer.equals(buyer)) {
+                    return err(`configured wallet ${buyer.toBase58()} is not the Auction RFQ buyer ${snap.buyer.toBase58()}`);
+                }
+                const built = buildInstantSpecFromAuctionSnapshot(snap, a);
+                const timeoutMs = clampInteger(a["timeout_ms"], INSTANT_RFQ_REQUEST_DEFAULT_TIMEOUT_MS, 500, INSTANT_RFQ_MAX_WINDOW_MS);
+                const maxQuotes = Math.min(Math.max(Number(a["max_quotes"] ?? 8), 1), 25);
+                const requiredCm = a["required_cm_pubkey"] === undefined || a["required_cm_pubkey"] === null
+                    ? null
+                    : new PublicKey(String(a["required_cm_pubkey"]));
+                const relayUrl = relayUrlFromArgs(a);
+                const seriesPrerequisite = await ensureInstantSeriesListed(skew, built);
+                const collected = await collectInstantRfqQuotes({
+                    buyer,
+                    request: built.request,
+                    relayUrl,
+                    timeoutMs,
+                    maxQuotes: requiredCm === null ? maxQuotes : 25,
+                });
+                const capMicro = BigInt(String(built.display["max_premium_micro"] ?? snap.maxPremiumMicro));
+                const acceptedQuotes = collected.quotes.filter((quote) => {
+                    if (quote.premiumMicro > capMicro)
+                        return false;
+                    if (requiredCm !== null && !quote.cmPubkey.equals(requiredCm))
+                        return false;
+                    return true;
+                });
+                const quotes = acceptedQuotes.slice(0, maxQuotes).map((quote) => ({
+                    relay_nonce: quote.relayNonce.toString(),
+                    cm_pubkey: quote.cmPubkey.toBase58(),
+                    premium_micro: quote.premiumMicro.toString(),
+                    premium_usd: Number(quote.premiumMicro) / 1_000_000,
+                    ttl_seconds: quote.ttlSeconds,
+                    received_at: quote.receivedAt,
+                    raw: serializeJson(quote.raw),
+                }));
+                return ok(JSON.stringify({
+                    success: true,
+                    execution_lane: "auction_terms_to_instant_rfq_atomic_fill",
+                    collateral_model: "portfolio_margin_delta_im",
+                    auction: {
+                        pda: auctionPda.toBase58(),
+                        buyer: snap.buyer.toBase58(),
+                        state: snap.state,
+                        best_quote_mm: snap.bestQuoteMm?.toBase58() ?? null,
+                        best_quote_premium_micro: snap.bestQuotePremiumMicro?.toString() ?? null,
+                        max_premium_micro: snap.maxPremiumMicro.toString(),
+                    },
+                    relay_url: relayUrl,
+                    buyer: buyer.toBase58(),
+                    relay_nonce: collected.relayNonce.toString(),
+                    series_prerequisite: seriesPrerequisite,
+                    request: built.display,
+                    premium_cap_micro: capMicro.toString(),
+                    required_cm_pubkey: requiredCm?.toBase58() ?? null,
+                    quote_count: quotes.length,
+                    rejected_quote_count: collected.quotes.length - acceptedQuotes.length,
+                    quotes,
+                    hit_quote_template: quotes.length === 0
+                        ? null
+                        : {
+                            tool: "skew_hit_instant_rfq_from_auction_quote",
+                            arguments: {
+                                auction: auctionPda.toBase58(),
+                                relay_nonce: collected.relayNonce.toString(),
+                                cm_pubkey: quotes[0]?.cm_pubkey,
+                                premium_micro: quotes[0]?.premium_micro,
+                            },
+                        },
+                    note: "This keeps Auction RFQ as the discovery/tape source, then PM-clears the selected terms through Instant RFQ atomic_fill_from_relay. No pre-funded 100% collateral bridge is used.",
+                }, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_request_instant_rfq_quotes": {
+                const skew = await getSkewClient();
+                const buyer = skew.walletPublicKey;
+                const built = buildInstantSpecFromArgs(a);
+                const timeoutMs = clampInteger(a["timeout_ms"], INSTANT_RFQ_REQUEST_DEFAULT_TIMEOUT_MS, 500, INSTANT_RFQ_MAX_WINDOW_MS);
+                const maxQuotes = Math.min(Math.max(Number(a["max_quotes"] ?? 8), 1), 25);
+                const requiredCm = a["required_cm_pubkey"] === undefined || a["required_cm_pubkey"] === null
+                    ? null
+                    : new PublicKey(String(a["required_cm_pubkey"]));
+                const relayUrl = relayUrlFromArgs(a);
+                const seriesPrerequisite = await ensureInstantSeriesListed(skew, built);
+                const collected = await collectInstantRfqQuotes({
+                    buyer,
+                    request: built.request,
+                    relayUrl,
+                    timeoutMs,
+                    maxQuotes: requiredCm === null ? maxQuotes : 25,
+                });
+                const acceptedQuotes = collected.quotes.filter((quote) => requiredCm === null ? true : quote.cmPubkey.equals(requiredCm));
+                const quotes = acceptedQuotes.slice(0, maxQuotes).map((quote) => ({
+                    relay_nonce: quote.relayNonce.toString(),
+                    cm_pubkey: quote.cmPubkey.toBase58(),
+                    premium_micro: quote.premiumMicro.toString(),
+                    premium_usd: Number(quote.premiumMicro) / 1_000_000,
+                    ttl_seconds: quote.ttlSeconds,
+                    received_at: quote.receivedAt,
+                    raw: serializeJson(quote.raw),
+                }));
+                return ok(JSON.stringify({
+                    success: true,
+                    execution_lane: "instant_rfq_atomic_fill",
+                    collateral_model: "portfolio_margin_delta_im",
+                    relay_url: relayUrl,
+                    buyer: buyer.toBase58(),
+                    relay_nonce: collected.relayNonce.toString(),
+                    series_prerequisite: seriesPrerequisite,
+                    request: built.display,
+                    required_cm_pubkey: requiredCm?.toBase58() ?? null,
+                    quote_count: quotes.length,
+                    rejected_quote_count: collected.quotes.length - acceptedQuotes.length,
+                    quotes,
+                    hit_quote_template: quotes.length === 0
+                        ? null
+                        : {
+                            tool: "skew_hit_instant_rfq_quote",
+                            arguments: {
+                                relay_nonce: collected.relayNonce.toString(),
+                                cm_pubkey: quotes[0]?.cm_pubkey,
+                                premium_micro: quotes[0]?.premium_micro,
+                                underlying: built.underlying,
+                                payoff: built.payoff,
+                                strike: built.display["strike_usd"],
+                                expiry: built.display["expiry_iso"],
+                                notional: built.display["notional"],
+                                upper_bound_usd: built.display["upper_bound_usd"],
+                                settlement_mint: built.settlement.label,
+                            },
+                        },
+                    note: "This only requests quotes. A PM-backed option is minted only after skew_hit_instant_rfq_quote returns fill_executed.",
+                }, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_hit_instant_rfq_quote": {
+                const skew = await getSkewClient();
+                const buyer = skew.walletPublicKey;
+                const cmPubkey = new PublicKey(String(a["cm_pubkey"]));
+                const built = buildInstantSpecFromArgs(a);
+                const premiumMicro = parsePremiumMicro(a);
+                const relayNonce = BigInt(String(a["relay_nonce"]));
+                const quoteExpirySeconds = clampInteger(a["quote_expiry_seconds"], INSTANT_RFQ_DEFAULT_QUOTE_EXPIRY_SECONDS, 10, INSTANT_RFQ_DEFAULT_QUOTE_EXPIRY_SECONDS);
+                const timeoutMs = clampInteger(a["timeout_ms"], INSTANT_RFQ_HIT_DEFAULT_TIMEOUT_MS, 5_000, INSTANT_RFQ_MAX_WINDOW_MS);
+                const relayUrl = relayUrlFromArgs(a);
+                const receipt = await executeInstantRfqHit({
+                    skew,
+                    buyer,
+                    built,
+                    relayNonce,
+                    cmPubkey,
+                    premiumMicro,
+                    quoteExpirySeconds,
+                    timeoutMs,
+                    relayUrl,
+                });
+                return ok(JSON.stringify(receipt, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_hit_instant_rfq_from_auction_quote": {
+                const skew = await getSkewClient();
+                const buyer = skew.walletPublicKey;
+                const auctionPda = new PublicKey(String(a["auction"]));
+                const snap = await skew.fetchRfqAuction(auctionPda);
+                if (snap === null) {
+                    return err(`RFQ auction not found: ${auctionPda.toBase58()}`);
+                }
+                if (!snap.buyer.equals(buyer)) {
+                    return err(`configured wallet ${buyer.toBase58()} is not the Auction RFQ buyer ${snap.buyer.toBase58()}`);
+                }
+                const cmPubkey = new PublicKey(String(a["cm_pubkey"]));
+                const built = buildInstantSpecFromAuctionSnapshot(snap, a);
+                const premiumMicro = parsePremiumMicro(a);
+                const capMicro = BigInt(String(built.display["max_premium_micro"] ?? snap.maxPremiumMicro));
+                if (premiumMicro > capMicro) {
+                    return err(`selected premium ${premiumMicro.toString()} exceeds Auction/Instant cap ${capMicro.toString()}`);
+                }
+                const relayNonce = BigInt(String(a["relay_nonce"]));
+                const quoteExpirySeconds = clampInteger(a["quote_expiry_seconds"], INSTANT_RFQ_DEFAULT_QUOTE_EXPIRY_SECONDS, 10, INSTANT_RFQ_DEFAULT_QUOTE_EXPIRY_SECONDS);
+                const timeoutMs = clampInteger(a["timeout_ms"], INSTANT_RFQ_HIT_DEFAULT_TIMEOUT_MS, 5_000, INSTANT_RFQ_MAX_WINDOW_MS);
+                const relayUrl = relayUrlFromArgs(a);
+                const receipt = await executeInstantRfqHit({
+                    skew,
+                    buyer,
+                    built,
+                    relayNonce,
+                    cmPubkey,
+                    premiumMicro,
+                    quoteExpirySeconds,
+                    timeoutMs,
+                    relayUrl,
+                    origin: {
+                        lane: "auction_rfq_terms_to_instant_rfq_atomic_fill",
+                        auction: auctionPda.toBase58(),
+                        auction_state: snap.state,
+                        auction_best_quote_mm: snap.bestQuoteMm?.toBase58() ?? null,
+                        auction_best_quote_premium_micro: snap.bestQuotePremiumMicro?.toString() ?? null,
+                    },
+                });
+                return ok(JSON.stringify(receipt, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_serve_instant_rfq_mm_once": {
+                const skew = await getSkewClient();
+                const maker = skew.walletPublicKey;
+                const premiumMicro = parsePremiumMicro(a);
+                const quoteTtlSeconds = clampInteger(a["quote_ttl_seconds"], INSTANT_RFQ_DEFAULT_QUOTE_EXPIRY_SECONDS, 5, INSTANT_RFQ_DEFAULT_QUOTE_EXPIRY_SECONDS);
+                const timeoutMs = clampInteger(a["timeout_ms"], INSTANT_RFQ_MAKER_DEFAULT_TIMEOUT_MS, 5_000, INSTANT_RFQ_MAX_WINDOW_MS);
+                const relayUrl = relayUrlFromArgs(a);
+                const autoPrepare = a["auto_prepare"] !== false;
+                const initialCollateralUsdc = Number(a["initial_collateral_usdc"] ?? 1_000);
+                const filterUnderlying = typeof a["filter_underlying"] === "string"
+                    ? String(a["filter_underlying"]).toUpperCase()
+                    : null;
+                const filterPayoff = typeof a["filter_payoff"] === "string" ? String(a["filter_payoff"]) : null;
+                if (filterUnderlying !== null && ASSET_INDEX[filterUnderlying] === undefined) {
+                    return err(`unknown filter_underlying ${filterUnderlying}`);
+                }
+                if (filterPayoff !== null) {
+                    instantPayoffWire(filterPayoff);
+                }
+                const prepare = autoPrepare
+                    ? await prepareInstantMaker(skew, initialCollateralUsdc, filterUnderlying ?? "BTC")
+                    : { skipped: true, reason: "auto_prepare=false" };
+                const receipt = await new Promise((resolve, reject) => {
+                    const ws = openRelayWs(relayUrl);
+                    let done = false;
+                    let quotedRequest = null;
+                    let quoteAck = null;
+                    let marginPreview = null;
+                    const finishOk = (out) => {
+                        if (done)
+                            return;
+                        done = true;
+                        try {
+                            ws.close();
+                        }
+                        catch {
+                            /* noop */
+                        }
+                        resolve(out);
+                    };
+                    const finishErr = (error) => {
+                        if (done)
+                            return;
+                        done = true;
+                        try {
+                            ws.close();
+                        }
+                        catch {
+                            /* noop */
+                        }
+                        reject(error);
+                    };
+                    const timer = setTimeout(() => {
+                        finishErr(new Error(quotedRequest === null
+                            ? "timed out waiting for Instant RFQ quote_request"
+                            : "timed out after quote_ack before fill_executed"));
+                    }, timeoutMs);
+                    ws.onerror = () => {
+                        clearTimeout(timer);
+                        finishErr(new Error("instant RFQ maker relay websocket error"));
+                    };
+                    ws.onclose = () => {
+                        if (!done && quotedRequest !== null) {
+                            clearTimeout(timer);
+                            finishErr(new Error("instant RFQ maker relay closed before fill_executed"));
+                        }
+                    };
+                    ws.onopen = () => {
+                        ws.send(JSON.stringify({
+                            kind: "identify",
+                            role: "cm",
+                            pubkey: maker.toBase58(),
+                        }));
+                    };
+                    ws.onmessage = (event) => {
+                        try {
+                            const msg = parseRelayMessage(event.data);
+                            const kind = typeof msg["kind"] === "string" ? String(msg["kind"]) : "";
+                            if (kind === "quote_request") {
+                                if (quotedRequest !== null)
+                                    return;
+                                if (!payloadMatchesFilter(msg, filterUnderlying, filterPayoff))
+                                    return;
+                                const relayNonce = String(msg["relay_nonce"] ?? "");
+                                if (relayNonce.length === 0)
+                                    return;
+                                quotedRequest = serializeJson(msg);
+                                quoteAck = {
+                                    kind: "quote_ack",
+                                    relay_nonce: relayNonce,
+                                    premium_micro: premiumMicro.toString(),
+                                    ttl_seconds: quoteTtlSeconds,
+                                };
+                                ws.send(JSON.stringify(quoteAck));
+                                return;
+                            }
+                            if (kind === "maker_margin_preview") {
+                                if (quotedRequest === null)
+                                    return;
+                                marginPreview = serializeJson(msg);
+                                return;
+                            }
+                            if (kind === "fill_consent") {
+                                if (quotedRequest === null)
+                                    return;
+                                const relayNonce = String(msg["relay_nonce"] ?? "");
+                                const payloadHex = String(msg["payload_hex"] ?? "");
+                                if (relayNonce.length === 0 || payloadHex.length === 0) {
+                                    clearTimeout(timer);
+                                    finishErr(new Error("fill_consent missing relay_nonce or payload_hex"));
+                                    return;
+                                }
+                                const payloadBytes = Uint8Array.from(Buffer.from(payloadHex, "hex"));
+                                const digest = relayPayloadDigest(payloadBytes);
+                                const cmSig = nacl.sign.detached(digest, loadWriteKeypair().secretKey);
+                                ws.send(JSON.stringify({
+                                    kind: "cm_sign",
+                                    relay_nonce: relayNonce,
+                                    cm_sig_b64: Buffer.from(cmSig).toString("base64"),
+                                }));
+                                return;
+                            }
+                            if (kind === "fill_executed") {
+                                clearTimeout(timer);
+                                finishOk({
+                                    filled: true,
+                                    maker: maker.toBase58(),
+                                    relay_url: relayUrl,
+                                    quote_request: quotedRequest,
+                                    quote_ack: quoteAck,
+                                    margin_preview: marginPreview,
+                                    fill_executed: serializeJson(msg),
+                                });
+                                return;
+                            }
+                            if (kind === "fill_failed" || kind === "error") {
+                                clearTimeout(timer);
+                                const detail = JSON.stringify(serializeJson(msg), null, 2);
+                                finishErr(new Error(`instant RFQ maker relay failure: ${String(msg["reason"] ?? msg["error"] ?? "unknown")}\n${detail}`));
+                            }
+                        }
+                        catch (e) {
+                            clearTimeout(timer);
+                            finishErr(e instanceof Error ? e : new Error(String(e)));
+                        }
+                    };
+                });
+                const cm = await skew.fetchClearingMember(maker);
+                return ok(JSON.stringify({
+                    success: true,
+                    execution_lane: "instant_rfq_atomic_fill",
+                    role: "maker_mm",
+                    maker: maker.toBase58(),
+                    relay_url: relayUrl,
+                    fixed_quote: {
+                        premium_micro: premiumMicro.toString(),
+                        premium_usd: Number(premiumMicro) / 1_000_000,
+                        ttl_seconds: quoteTtlSeconds,
+                    },
+                    prepare,
+                    receipt,
+                    clearing_member_after: cm
+                        ? {
+                            positions_count: cm.positionsCount,
+                            collateral_micro: cm.collateralMicro.toString(),
+                            total_pm_locked_micro: cm.totalPmLockedMicro.toString(),
+                            total_pm_locked_usd: Number(cm.totalPmLockedMicro) / 1_000_000,
+                            last_im_micro: cm.lastImMicro.toString(),
+                            last_im_usd: Number(cm.lastImMicro) / 1_000_000,
+                            free_collateral_micro: cm.freeCollateralMicro.toString(),
+                            free_collateral_usd: Number(cm.freeCollateralMicro) / 1_000_000,
+                        }
+                        : null,
+                }, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_create_option_from_rfq_quote": {
+                const skew = await getSkewClient();
+                const result = await skew.createOptionFromRfqAuction({
+                    auction: String(a["auction"]),
+                    allowExpiredQuote: a["allow_expired_quote"] === true,
+                    requireBestQuoteForMaker: a["require_best_quote_for_maker"] !== false,
+                    dryRun: a["dry_run"] === true,
+                });
+                return ok(JSON.stringify({
+                    success: true,
+                    simulated: result.simulated === true,
+                    auction: result.auction,
+                    buyer: result.buyer,
+                    maker: result.maker,
+                    quote_mm: result.quoteMm,
+                    premium_micro: result.premiumMicro.toString(),
+                    premium_usd: result.premiumUsd,
+                    option_address: result.option,
+                    option_token_mint: result.optionTokenMint,
+                    create_tx: result.createTx,
+                    deposit_tx: result.depositTx,
+                    create_params: result.createParams,
+                    next_buyer_step: result.simulated === true
+                        ? null
+                        : {
+                            tool: "skew_buy_option_from_rfq_quote",
+                            arguments: {
+                                auction: result.auction,
+                                option_address: result.option,
+                            },
+                            note: "Buyer-side guarded RFQ buy. It refetches the auction, verifies terms, and pays the exact current best firm quote premium.",
+                        },
+                    readback_steps: result.simulated === true
+                        ? [
+                            {
+                                unavailable_until_real_send: true,
+                                reason: "dry_run/simulate_only does not create the option PDA on-chain, so buy/readback tools are intentionally omitted.",
+                            },
+                        ]
+                        : [
+                            {
+                                tool: "skew_list_options",
+                                arguments: { filter_option_pda: result.option },
+                            },
+                            {
+                                tool: "skew_fetch_portfolio",
+                                arguments: { owner: result.buyer },
+                            },
+                            {
+                                tool: "skew_fetch_portfolio",
+                                arguments: { owner: result.maker },
+                            },
+                        ],
+                    simulation: result.simulation,
+                }, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_buy_option_from_rfq_quote": {
+                const skew = await getSkewClient();
+                const auction = String(a["auction"]);
+                const optionAddress = String(a["option_address"]);
+                const result = await skew.buyOptionFromRfqAuction({
+                    auction,
+                    option: optionAddress,
+                    allowExpiredQuote: a["allow_expired_quote"] === true,
+                });
+                const buyerPortfolio = await skew.getPortfolio(result.buyer);
+                const makerPortfolio = await skew.getPortfolio(result.maker);
                 return ok(JSON.stringify({
                     success: true,
                     tx_signature: result.txSignature,
+                    auction: result.auction,
+                    option_address: result.optionAddress ?? optionAddress,
+                    option_token_mint: result.optionTokenMint,
+                    buyer_option_ata: result.buyerOptionAta,
+                    buyer_option_amount: result.buyerOptionAmount,
+                    buyer: result.buyer,
+                    maker: result.maker,
+                    quote_mm: result.quoteMm,
+                    premium_micro: result.premiumMicro.toString(),
+                    premium_usd: result.premiumUsd,
+                    verified_terms: result.verifiedTerms,
+                    option: optionSummaryForJson(result.option ?? null),
+                    buyer_portfolio_counts: {
+                        long: buyerPortfolio.longOptions.length,
+                        short: buyerPortfolio.shortOptions.length,
+                        total: buyerPortfolio.options.length,
+                    },
+                    maker_portfolio_counts: {
+                        long: makerPortfolio.longOptions.length,
+                        short: makerPortfolio.shortOptions.length,
+                        total: makerPortfolio.options.length,
+                    },
+                    readback_steps: [
+                        {
+                            tool: "skew_fetch_portfolio",
+                            arguments: { owner: result.buyer },
+                        },
+                        {
+                            tool: "skew_fetch_portfolio",
+                            arguments: { owner: result.maker },
+                        },
+                    ],
+                    explorer: `https://explorer.solana.com/tx/${result.txSignature}?cluster=devnet`,
+                }, null, 2));
+            }
+            // -----------------------------------------------------------------------
+            case "skew_buy_option": {
+                const skew = await getSkewClient();
+                const optionAddress = String(a["option_address"]);
+                const premiumUsd = Number(a["premium_usd"]);
+                const result = await skew.buy(optionAddress, premiumUsd);
+                return ok(JSON.stringify({
+                    success: true,
+                    tx_signature: result.txSignature,
+                    option_address: optionAddress,
+                    option_token_mint: result.optionTokenMint,
+                    buyer_option_ata: result.buyerOptionAta,
+                    buyer_option_amount: result.buyerOptionAmount,
+                    premium_usd: premiumUsd,
+                    option: optionSummaryForJson(result.option ?? null),
+                    readback_steps: [
+                        {
+                            tool: "skew_fetch_portfolio",
+                            arguments: { owner: skew.walletPublicKey.toBase58() },
+                        },
+                    ],
                     explorer: `https://explorer.solana.com/tx/${result.txSignature}?cluster=devnet`,
                 }, null, 2));
             }
@@ -794,6 +2521,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     success: true,
                     tx_signature: result.txSignature,
                     payoff_usd: result.payoffUsd,
+                    explorer: `https://explorer.solana.com/tx/${result.txSignature}?cluster=devnet`,
+                }, null, 2));
+            }
+            case "skew_liquidate_option": {
+                const skew = await getSkewClient();
+                const result = await skew.liquidate(String(a["option_address"]), String(a["defaulting_cm_authority"]), Number(a["close_factor_bps"] ?? 5000), Number(a["min_expected_bonus_bps"] ?? 0));
+                return ok(JSON.stringify({
+                    success: true,
+                    tx_signature: result.txSignature,
                     explorer: `https://explorer.solana.com/tx/${result.txSignature}?cluster=devnet`,
                 }, null, 2));
             }
@@ -819,8 +2555,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     note: "IM is recomputed on-chain across the 5 launch-asset volatility PDAs and stamped into the CM account. utilization = im_locked / collateral; free_collateral = collateral − im_locked.",
                 }, null, 2));
             }
+            case "skew_refresh_pm_cache_full": {
+                const skew = await getSkewClient();
+                const refresh = skew.refreshPmCacheFull;
+                if (!refresh) {
+                    return err("Installed @skew-labs/sdk does not expose refreshPmCacheFull yet. Upgrade SDK to the PM-cache build before using this write tool.");
+                }
+                const currentSpot = a["current_spot_usd"] == null ? undefined : Number(a["current_spot_usd"]);
+                const result = await refresh.call(skew, currentSpot);
+                return ok(JSON.stringify({ success: true, result: serializeJson(result) }, null, 2));
+            }
+            case "skew_prepare_rent_reclaim_batch": {
+                const authority = await authorityFromArgs(a, "authority");
+                const json = await skewWebJson("/api/rent-reclaim/prepare", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ authority }),
+                });
+                return ok(JSON.stringify(json, null, 2));
+            }
             // -----------------------------------------------------------------------
-            // Phase 1639 — Verified-tier ladder + RFQ + conditional orders + reads
+            // Phase 1639 — clearing-class ladder + RFQ + conditional orders + reads
             // -----------------------------------------------------------------------
             case "skew_upgrade_tier": {
                 const skew = await getSkewClient();
@@ -846,6 +2601,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const assetIdx = ASSET_INDEX[underlying] ?? 0;
                 const strikeMicro = BigInt(Math.round(Number(a["strike"]) * 1e8));
                 const expiryTs = BigInt(Math.floor(new Date(String(a["expiry"])).getTime() / 1000));
+                try {
+                    assertExpiryTenor(assetIdx, expiryTs, { context: "register_rfq_auction" });
+                }
+                catch (e) {
+                    const allowed = SKEW_ALLOWED_TENORS_BY_UNDERLYING[underlying] ?? [];
+                    const suggestedExpiries = allowed.map((days) => ({
+                        tenor_days: days,
+                        expiry_iso: expiryFromTenorDays(days),
+                    }));
+                    return typedErr("UnsupportedExpiryTenor", e instanceof Error ? e.message : String(e), {
+                        underlying,
+                        allowed_tenors_days: allowed,
+                        tolerance_seconds: TENOR_TOLERANCE_SECONDS,
+                        suggested_expiries: suggestedExpiries,
+                        tape_visibility: "This request was not published. The terminal RFQ tape only shows successfully registered Auction RFQ PDAs or live Instant RFQ relay nonces.",
+                    });
+                }
                 const payoffAmountMicro = BigInt(Math.round(Number(a["notional"]) * 1e6));
                 // Map payoff string to on-chain (option_type:u8, direction:i8) pair.
                 // OptionType ordinal: Vanilla=0, Digital=1, CappedVanilla=2, RangeAccrual=3,
@@ -1085,9 +2857,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
             case "skew_fetch_clearing_member": {
                 const skew = await getReadOnlySkewClient();
-                const authority = a["cm_authority"]
-                    ? new PublicKey(String(a["cm_authority"]))
-                    : (await getSkewClient()).walletPublicKey;
+                const authority = new PublicKey(await authorityFromArgs(a, "cm_authority"));
                 const snap = await skew.fetchClearingMember(authority);
                 if (snap == null) {
                     return ok(JSON.stringify({
@@ -1096,7 +2866,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         note: "CM not registered. Call skew_register_clearing_member first.",
                     }, null, 2));
                 }
-                const tierName = ["Standard", "Silver", "Gold", "Platinum"][snap.tier];
+                const tierName = ["M0 Segregated", "M1 Portfolio", "M2 Cross-Asset", "M3 Clearing Prime"][snap.tier];
                 return ok(JSON.stringify({
                     success: true,
                     registered: true,
@@ -1269,7 +3039,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const snap = await skew.fetchRfqAuction(new PublicKey(String(a["auction"])));
                 if (snap == null)
                     return ok(JSON.stringify({ success: true, initialised: false, note: "RfqAuctionPda not found." }, null, 2));
-                return ok(JSON.stringify({ success: true, initialised: true, snapshot: serializeJson(snap) }, null, 2));
+                let handoffTemplate = null;
+                try {
+                    const built = buildInstantSpecFromAuctionSnapshot(snap, {});
+                    handoffTemplate = {
+                        execution_lane: "auction_terms_to_instant_rfq_atomic_fill",
+                        request_tool: "skew_request_instant_rfq_from_auction",
+                        request_arguments: {
+                            auction: snap.pda.toBase58(),
+                        },
+                        hit_tool: "skew_hit_instant_rfq_from_auction_quote",
+                        hit_arguments: {
+                            auction: snap.pda.toBase58(),
+                            relay_nonce: "<RELAY_NONCE_FROM_REQUEST>",
+                            cm_pubkey: "<QUOTE_CM>",
+                            premium_micro: "<QUOTE_PREMIUM_MICRO>",
+                        },
+                        derived_request: built.display,
+                        note: "Auction RFQ is firm tape. This template PM-clears the same terms through Instant RFQ atomic_fill_from_relay.",
+                    };
+                }
+                catch (e) {
+                    handoffTemplate = {
+                        unavailable: true,
+                        reason: e instanceof Error ? e.message : String(e),
+                    };
+                }
+                return ok(JSON.stringify({
+                    success: true,
+                    initialised: true,
+                    snapshot: serializeJson(snap),
+                    instant_rfq_handoff_template: handoffTemplate,
+                }, null, 2));
             }
             case "skew_fetch_combo_intent_v2": {
                 const skew = await getReadOnlySkewClient();
@@ -1281,8 +3082,136 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // Lifecycle ───────────────────────────────────────────────────────────
             case "skew_transfer_option": {
                 const skew = await getSkewClient();
-                const r = await skew.transferOption(String(a["option"]), String(a["new_holder"]));
-                return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
+                const option = a["option"] ?? a["option_address"];
+                if (option == null)
+                    return err("skew_transfer_option requires option or option_address");
+                const optionAddress = String(option);
+                const newHolder = new PublicKey(String(a["new_holder"]));
+                const before = await skew.listOptions({ pda: new PublicKey(optionAddress), limit: 1 });
+                const oldHolder = before.length > 0 ? String(before[0]?.holder ?? skew.walletPublicKey.toBase58()) : null;
+                const r = await skew.transferOption(optionAddress, newHolder);
+                let transferred = [];
+                for (let attempt = 0; attempt < 10; attempt += 1) {
+                    transferred = await skew.listOptions({ pda: new PublicKey(optionAddress), limit: 1 });
+                    if (transferred.length > 0 && transferred[0]?.holder === newHolder.toBase58()) {
+                        break;
+                    }
+                    await sleep(500);
+                }
+                const optionReadback = optionSummaryForJson(transferred[0] ?? null);
+                const holderChanged = optionReadback?.["holder"] === newHolder.toBase58();
+                const [newHolderPortfolio, oldHolderPortfolio] = await Promise.all([
+                    skew.getPortfolio(newHolder),
+                    oldHolder === null ? Promise.resolve(null) : skew.getPortfolio(new PublicKey(oldHolder)),
+                ]);
+                const newHolderContains = newHolderPortfolio.longOptions.some((s) => s.pda === optionAddress);
+                const oldHolderContains = oldHolderPortfolio === null
+                    ? null
+                    : oldHolderPortfolio.longOptions.some((s) => s.pda === optionAddress);
+                const readbackOk = holderChanged && newHolderContains && oldHolderContains === false;
+                const readbackErrors = [
+                    ...(holderChanged
+                        ? []
+                        : [
+                            `post-transfer holder readback did not equal new_holder ${newHolder.toBase58()}`,
+                        ]),
+                    ...(newHolderContains ? [] : ["new holder portfolio does not contain transferred option"]),
+                    ...(oldHolderContains === false || oldHolderContains === null
+                        ? []
+                        : ["old holder portfolio still contains transferred option"]),
+                ];
+                return ok(JSON.stringify({
+                    success: readbackOk,
+                    readback_ok: readbackOk,
+                    readback_errors: readbackErrors,
+                    tx_signature: r.txSignature,
+                    option_address: optionAddress,
+                    old_holder: oldHolder,
+                    new_holder: newHolder.toBase58(),
+                    option: optionReadback,
+                    new_holder_portfolio_contains_option: newHolderContains,
+                    old_holder_portfolio_contains_option: oldHolderContains,
+                }, null, 2));
+            }
+            case "skew_track_held_position": {
+                const skew = await getSkewClient();
+                const option = a["option"] ?? a["option_address"];
+                if (option == null)
+                    return err("skew_track_held_position requires option or option_address");
+                const optionAddress = String(option);
+                const before = await skew.fetchClearingMember(skew.walletPublicKey);
+                const r = await skew.trackHeldPosition(optionAddress);
+                const [after, portfolio, listed] = await Promise.all([
+                    skew.fetchClearingMember(skew.walletPublicKey),
+                    skew.getPortfolio(skew.walletPublicKey),
+                    skew.listOptions({ pda: new PublicKey(optionAddress), limit: 1 }),
+                ]);
+                const tracked = portfolio.longOptions.some((s) => s.pda === optionAddress);
+                return ok(JSON.stringify({
+                    success: tracked,
+                    readback_ok: tracked,
+                    tx_signature: r.txSignature,
+                    option_address: optionAddress,
+                    cm_pda: r.cmPda.toBase58(),
+                    position_registry: r.positionRegistry.toBase58(),
+                    option: optionSummaryForJson(listed[0] ?? null),
+                    positions_count_before: before?.positionsCount ?? null,
+                    positions_count_after: after?.positionsCount ?? null,
+                    total_pm_locked_usdc_after: after === null ? null : Number(after.totalPmLockedMicro) / 1_000_000,
+                    last_im_usdc_after: after === null ? null : Number(after.lastImMicro) / 1_000_000,
+                    portfolio_contains_tracked_long: tracked,
+                    note: "This long is now visible to the CM PM registry. Run skew_get_margin, or use future atomic_fill_from_relay fills, to see it offset writer risk.",
+                }, null, 2));
+            }
+            case "skew_untrack_held_position": {
+                const skew = await getSkewClient();
+                const option = a["option"] ?? a["option_address"];
+                if (option == null)
+                    return err("skew_untrack_held_position requires option or option_address");
+                const optionAddress = String(option);
+                const before = await skew.fetchClearingMember(skew.walletPublicKey);
+                const r = await skew.untrackHeldPosition(optionAddress);
+                const [after, portfolio] = await Promise.all([
+                    skew.fetchClearingMember(skew.walletPublicKey),
+                    skew.getPortfolio(skew.walletPublicKey),
+                ]);
+                const stillTracked = portfolio.longOptions.some((s) => s.pda === optionAddress);
+                return ok(JSON.stringify({
+                    success: !stillTracked,
+                    readback_ok: !stillTracked,
+                    tx_signature: r.txSignature,
+                    option_address: optionAddress,
+                    positions_count_before: before?.positionsCount ?? null,
+                    positions_count_after: after?.positionsCount ?? null,
+                    portfolio_still_contains_tracked_long: stillTracked,
+                }, null, 2));
+            }
+            case "skew_rebalance_pm_lock": {
+                const skew = await getSkewClient();
+                const option = a["option"] ?? a["option_address"];
+                if (option == null)
+                    return err("skew_rebalance_pm_lock requires option or option_address");
+                const optionAddress = String(option);
+                const beforeListed = await skew.listOptions({ pda: new PublicKey(optionAddress), limit: 1 });
+                const creator = beforeListed.length > 0 && beforeListed[0]?.creator
+                    ? new PublicKey(String(beforeListed[0].creator))
+                    : null;
+                const beforeCm = creator === null ? null : await skew.fetchClearingMember(creator);
+                const r = await skew.rebalancePmLock(optionAddress, Number(a["max_release_usdc"] ?? 0));
+                const [afterListed, afterCm] = await Promise.all([
+                    skew.listOptions({ pda: new PublicKey(optionAddress), limit: 1 }),
+                    creator === null ? Promise.resolve(null) : skew.fetchClearingMember(creator),
+                ]);
+                return ok(JSON.stringify({
+                    success: true,
+                    tx_signature: r.txSignature,
+                    option_address: optionAddress,
+                    writer: creator?.toBase58() ?? null,
+                    total_pm_locked_usdc_before: beforeCm === null ? null : Number(beforeCm.totalPmLockedMicro) / 1_000_000,
+                    total_pm_locked_usdc_after: afterCm === null ? null : Number(afterCm.totalPmLockedMicro) / 1_000_000,
+                    option_before: optionSummaryForJson(beforeListed[0] ?? null),
+                    option_after: optionSummaryForJson(afterListed[0] ?? null),
+                }, null, 2));
             }
             case "skew_rollover_option": {
                 const skew = await getSkewClient();
@@ -1400,12 +3329,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 });
                 return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
             }
+            case "skew_submit_rfq_quote_direct": {
+                const skew = await getSkewClient();
+                const r = await skew.submitRfqQuoteDirect({
+                    auction: new PublicKey(String(a["auction"])),
+                    premiumMicro: BigInt(String(a["premium_micro"])),
+                    validUntilSlot: BigInt(String(a["valid_until_slot"])),
+                });
+                return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
+            }
             case "skew_finalize_rfq_auction": {
                 const skew = await getSkewClient();
-                const r = await skew.finalizeRfqAuction({
+                const finalizeArgs = {
                     auction: new PublicKey(String(a["auction"])),
-                    buyerUsdcAta: new PublicKey(String(a["buyer_usdc_ata"])),
-                });
+                };
+                if (typeof a["buyer_usdc_ata"] === "string" && a["buyer_usdc_ata"].length > 0) {
+                    finalizeArgs.buyerUsdcAta = new PublicKey(String(a["buyer_usdc_ata"]));
+                }
+                const r = await skew.finalizeRfqAuction(finalizeArgs);
                 return ok(JSON.stringify({ success: true, tx_signature: r.txSignature }, null, 2));
             }
             case "skew_cancel_rfq_auction": {
@@ -1701,6 +3642,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes("required when no write keypair is configured")) {
+            return typedErr("AuthorityRequired", msg, {
+                activeProfile: MCP_PROFILE,
+                hasWriteKeypair: HAS_WRITE_KEYPAIR,
+            });
+        }
+        if (msg.startsWith("No write key configured.")) {
+            return typedErr("WriteKeyRequired", msg, {
+                activeProfile: MCP_PROFILE,
+                requiredEnv: ["SKEW_KEYPAIR_PATH", "KEYPAIR_PATH", "SKEW_PRIVATE_KEY"],
+            });
+        }
         return err(msg);
     }
 });

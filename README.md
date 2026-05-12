@@ -219,6 +219,13 @@ Agents should treat `usable=false` as a hard blocker and route through
 `skew_refresh_pm_cache_full` or the full-walk path. The cache is a hot-path
 optimization with full-walk audit fallback, not off-chain margin.
 
+The live Instant RFQ relay follows the same rule automatically for PM books:
+when a maker has at least one tracked position, it checks the cache, refreshes
+on stale/missing/count mismatch, and only then builds `atomic_fill_from_relay`
+with `pmRiskCache`. If refresh cannot make the cache usable, the fill fails
+closed instead of falling back to a large transaction that can exceed Solana's
+size limit.
+
 `skew_list_rent_reclaimable` exposes owner-first PDA close candidates and
 their blockers. It never claims an account can be closed if a holder claim,
 locked collateral quantity, liquidation hold, or slashable maker state remains.

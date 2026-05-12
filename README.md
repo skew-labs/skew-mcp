@@ -6,7 +6,7 @@ Devnet launch-ready, audit-gated.
 Install the current npm release with `npx -y @skew-labs/mcp@latest`.
 The package backs the same `skew-master` Anchor
 program (123 ix · devnet `3w2qSp1UnuTbTfdHPXxm3zZaz6JZRmPpbmHf56Y1DsgK`) as
-`@skew-labs/sdk` `0.7.8+`.
+`@skew-labs/sdk` `0.7.9+`.
 
 The server lets AI agents read market data, estimate pricing and margin, and
 inspect option, RFQ, collateral-policy, and clearing-member state through the
@@ -16,6 +16,41 @@ surfaces require explicit profiles and a configured keypair.
 
 [![npm](https://img.shields.io/npm/v/@skew-labs/mcp?style=flat-square)](https://www.npmjs.com/package/@skew-labs/mcp)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+
+## Evaluation Quickstart
+
+Use MCP when the evaluation is agent-driven. Use the SDK example when you want
+the smallest reproducible script. In both cases, the official path is:
+
+```txt
+Auction RFQ -> Instant RFQ atomic fill -> PM readback
+```
+
+Minimal devnet config:
+
+```json
+{
+  "mcpServers": {
+    "skew": {
+      "command": "npx",
+      "args": ["-y", "@skew-labs/mcp@latest"],
+      "env": {
+        "SKEW_MCP_PROFILE": "rfq",
+        "SKEW_RPC_URL": "https://devnet.helius-rpc.com/?api-key=YOUR_KEY",
+        "SKEW_RELAY_URL": "wss://skew-relay-devnet.fly.dev/subscribe",
+        "SKEW_DEVNET_USDC_MINT": "4T2KU8PXd25XvMh6kzv3F7d55yPP6NcS7HemERBe97K8",
+        "SKEW_KEYPAIR_PATH": "~/.config/solana/devnet.json"
+      }
+    }
+  }
+}
+```
+
+The agent should call `skew_get_signer_info` first, then
+`skew_get_capabilities`, then use Instant RFQ tools for PM-backed fills. A
+successful PM-backed receipt must show `trade_state=FILLED`,
+`pm_backed=true`, `pm_guarantee=guaranteed`, buyer/maker readback, and PM lock
+delta fields.
 
 ## Agent Playbook
 

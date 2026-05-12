@@ -6,7 +6,7 @@ Devnet launch-ready, audit-gated.
 Install the current npm release with `npx -y @skew-labs/mcp@latest`.
 The package backs the same `skew-master` Anchor
 program (123 ix · devnet `3w2qSp1UnuTbTfdHPXxm3zZaz6JZRmPpbmHf56Y1DsgK`) as
-`@skew-labs/sdk` `0.7.7+`.
+`@skew-labs/sdk` `0.7.8+`.
 
 The server lets AI agents read market data, estimate pricing and margin, and
 inspect option, RFQ, collateral-policy, and clearing-member state through the
@@ -158,8 +158,10 @@ currently accepts. Agents should call it before routing wSOL/jitoSOL or custom
 devnet mints.
 
 `skew_get_capabilities.tenorPolicy` is the runtime-safe expiry guide for write
-tools: live create/fill paths currently accept 1d / 7d / 14d / 28d / 90d
-buckets with ±1h tolerance. Sub-1d binaries are intentionally not enabled.
+tools. Live create/fill paths accept asset-specific buckets with +/-1h
+tolerance: BTC/ETH/SOL support 1d / 7d / 14d / 28d / 90d, XRP supports
+7d / 14d / 28d, and HYPE supports 1d / 7d / 14d / 28d. Sub-1d binaries are
+intentionally not enabled.
 
 `skew_fetch_pm_cache` reports the registry-hash-pinned CM risk cache state.
 Agents should treat `usable=false` as a hard blocker and route through

@@ -52,6 +52,22 @@ successful PM-backed receipt must show `trade_state=FILLED`,
 `pm_backed=true`, `pm_guarantee=guaranteed`, buyer/maker readback, and PM lock
 delta fields.
 
+Known boundaries for agents:
+
+| Surface | Contract |
+|---|---|
+| Official PM path | Use Instant RFQ tools or Auction-to-Instant handoff; successful fills settle through `atomic_fill_from_relay`. |
+| Auction finalize | Discovery only; it does not mint or clear the option by itself. |
+| Legacy/pre-funded | Hidden from `trading`/`rfq` profiles unless advanced mode is intentionally selected. It is not the PM demo path. |
+| Terminal | RFQ Tape and Secondary Tape discovery only. Agents should execute with MCP/SDK tools, then read back. |
+
+Verification snapshot:
+
+- Pricing, Greeks, and PM preview matrix: 175/175 pass.
+- Live RFQ request/build matrix: 159/159 pass.
+- Expected local tenor rejects: 16/16 correctly rejected.
+- Representative devnet Auction -> Instant PM fill: pass with PM readback.
+
 ## Agent Playbook
 
 Every Skew MCP session should begin with the same two calls:
@@ -143,7 +159,7 @@ What MCP **does not** cover:
 If you need any of those, hit `@skew-labs/sdk` directly — see the `Methods` table at <https://github.com/skew-labs/skew/tree/main/skew/skew-sdk#methods>.
 
 For programmatic RFQ integrations, the canonical flow is the SDK facade
-documented at <https://github.com/skew-labs/skew/blob/main/docs/api/official-rfq.md>:
+documented at <https://github.com/skew-labs/skew/blob/main/skew/docs/api/official-rfq.md>:
 `skew.rfq.request() -> rfq.quotes() -> rfq.accept()`. If the user starts with
 Auction discovery, use `skew.rfq.auctionAndFill()` or the MCP
 `skew_request_instant_rfq_from_auction -> skew_hit_instant_rfq_from_auction_quote`

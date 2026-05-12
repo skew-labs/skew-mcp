@@ -6,7 +6,7 @@ Devnet launch-ready, audit-gated.
 Install the current npm release with `npx -y @skew-labs/mcp@latest`.
 The package backs the same `skew-master` Anchor
 program (123 ix · devnet `3w2qSp1UnuTbTfdHPXxm3zZaz6JZRmPpbmHf56Y1DsgK`) as
-`@skew-labs/sdk` `0.7.5+`.
+`@skew-labs/sdk` `0.7.7+`.
 
 The server lets AI agents read market data, estimate pricing and margin, and
 inspect option, RFQ, collateral-policy, and clearing-member state through the
@@ -44,7 +44,7 @@ wallet.
 | Buyer wants PM-backed issuance now | Instant RFQ atomic fill | Buyer: `skew_request_instant_rfq_quotes` → `skew_hit_instant_rfq_quote`; maker terminal: `skew_serve_instant_rfq_mm_once` |
 | Buyer starts from an Auction RFQ PDA but wants PM-backed issuance | Auction terms → Instant RFQ bridge | `skew_request_instant_rfq_from_auction` → `skew_hit_instant_rfq_from_auction_quote` |
 | Buyer wants price discovery / firm quote tape | Auction RFQ | `skew_register_rfq_auction`, `skew_submit_rfq_quote_direct`, `skew_finalize_rfq_auction` |
-| Buyer and seller intentionally use fully funded legacy issuance | Pre-funded option bridge | Maker: `skew_create_option_from_rfq_quote`; buyer: `skew_buy_option_from_rfq_quote` |
+| Buyer and seller intentionally use fully funded legacy issuance | Advanced-only pre-funded bridge | `SKEW_MCP_PROFILE=advanced`; maker: `skew_create_option_from_rfq_quote`; buyer: `skew_buy_option_from_rfq_quote` |
 | Seller lists an existing option | Secondary discovery tape | Seller: `skew_create_secondary_listing`; buyer: `skew_buy_secondary_listing`; seller delivery: `skew_transfer_option` |
 
 ### Receipt Rules
@@ -55,6 +55,10 @@ Agents should report success only after readback:
 - PM-backed fill complete: response includes transaction signature, option
   PDA, buyer-long readback, maker-short/CM registry readback, and margin or PM
   preflight data.
+- Trading receipts include normalized `execution_lane`, `trade_state`,
+  `clearing_state`, `pm_backed`, `pm_guarantee`, `registry_updated`, and
+  when relevant `rejection_reason`. Agents should report these fields instead
+  of inferring lifecycle state from a tx signature alone.
 - Auction finalize complete: report firm tape/refund status only. It is not an
   option mint by itself.
 - Secondary payment complete: report pending delivery until
@@ -64,6 +68,7 @@ Agents should report success only after readback:
 ### Things Agents Must Not Say
 
 - Do not say `finalize_rfq_auction` minted an option.
+- Do not use the quote-bound pre-funded bridge for official Auction execution.
 - Do not say a secondary listing is delivered after payment alone.
 - Do not say a local script or smoke test proves MCP product success.
 - Do not continue a write workflow when `skew_get_signer_info` shows the wrong
@@ -76,14 +81,14 @@ Skew MCP is profile-gated because agents choose tools better when the visible su
 | Profile | Set with `SKEW_MCP_PROFILE` | Visible tools | Intended user |
 |---|---:|---:|---|
 | `core` | default | 20 | First-time builders, desks, and evaluation sessions |
-| `trading` | `trading` | 39 | Core + lifecycle write tools (create / buy / settle / CM bootstrap) |
-| `rfq` | `rfq` | 42 | Core + auction RFQ, Instant RFQ, maker quote, and secondary trade tools |
-| `advanced` | `advanced` | 110 | Builders operating conditional, combo, vault, builder, series, and snapshot workflows |
+| `trading` | `trading` | 41 | Core + lifecycle write tools (create / buy / settle / CM bootstrap). Quote-bound Auction bridge tools stay advanced-only. |
+| `rfq` | `rfq` | 43 | Core + auction RFQ, Instant RFQ, maker quote, and secondary trade tools. Official Auction execution uses the Instant PM handoff. |
+| `advanced` | `advanced` | 114 | Builders operating conditional, combo, vault, builder, series, and snapshot workflows |
 | `governance` | `governance` | 8 | Explicit admin/governance sessions only |
-| `all` | `all` | 115 | Internal development and audit checks |
+| `all` | `all` | 119 | Internal development and audit checks |
 
 The current IDL exposes Auction RFQ direct quote, `refresh_quote`, and the MakerAxe instruction family. Write tools remain hidden at runtime unless local signing mode is active and `SKEW_KEYPAIR_PATH`, `KEYPAIR_PATH`, or `SKEW_PRIVATE_KEY` is configured.
-Four unsafe/state-only actions are hidden from every profile until their complete settlement routes ship: `skew_take_best_quote`, `skew_apply_early_exercise_action`, `skew_apply_sell_via_rfq_action`, and `skew_apply_buyback_via_rfq_action`. Stale clients receive a typed `ToolDisabled` error.
+Four unsafe/state-only actions are hidden from every profile until their complete settlement routes ship: `skew_take_best_quote`, `skew_apply_early_exercise_action`, `skew_apply_sell_via_rfq_action`, and `skew_apply_buyback_via_rfq_action`. The legacy quote-bound pre-funded bridge remains available only in `advanced` / `all`; it is hidden from `trading` and `rfq` so Auction settlement routes through Instant PM fill. Stale clients receive a typed `ToolDisabled` error.
 
 > Counts above are sourced from `src/tools.ts` (`CORE_TOOL_ORDER`, `TRADING_TOOL_ORDER`, `RFQ_TOOL_ORDER`, `GOVERNANCE_TOOL_ORDER`, `DEPRECATED_TOOL_NAMES`, `GOVERNANCE_ONLY_TOOL_NAMES`). Cross-referenced in `docs/audit/W29_MCP_PRICING_INDEXER_WEB_ALIGNMENT_2026-05-09.md` §1. Re-verify with: `node -e 'import("./dist/tools.js").then(m=>["core","trading","rfq","advanced","governance","all"].forEach(p=>console.log(p, m.getSkewTools(p).length)))'`.
 
@@ -104,9 +109,12 @@ If you need any of those, hit `@skew-labs/sdk` directly — see the `Methods` ta
 
 For programmatic RFQ integrations, the canonical flow is the SDK facade
 documented at <https://github.com/skew-labs/skew/blob/main/docs/api/official-rfq.md>:
-`skew.rfq.request() -> rfq.quotes() -> rfq.accept()`. MCP exposes the same
-Instant RFQ lane for agents, but SDK is the cleanest surface for production
-bots and institutional integrations.
+`skew.rfq.request() -> rfq.quotes() -> rfq.accept()`. If the user starts with
+Auction discovery, use `skew.rfq.auctionAndFill()` or the MCP
+`skew_request_instant_rfq_from_auction -> skew_hit_instant_rfq_from_auction_quote`
+handoff; both force settlement through Instant RFQ `atomic_fill_from_relay`.
+MCP exposes the same Instant RFQ lane for agents, but SDK is the cleanest
+surface for production bots and institutional integrations.
 
 ---
 

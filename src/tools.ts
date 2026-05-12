@@ -38,8 +38,6 @@ const TRADING_TOOL_ORDER = [
   "skew_hit_instant_rfq_from_auction_quote",
   "skew_serve_instant_rfq_mm_once",
   "skew_create_option",
-  "skew_create_option_from_rfq_quote",
-  "skew_buy_option_from_rfq_quote",
   "skew_buy_option",
   "skew_create_secondary_listing",
   "skew_buy_secondary_listing",
@@ -66,9 +64,6 @@ const RFQ_TOOL_ORDER = [
   "skew_register_rfq_auction",
   "skew_register_rfq_maker",
   "skew_init_volume_tracker",
-  "skew_create_option_from_rfq_quote",
-  "skew_buy_option_from_rfq_quote",
-  "skew_buy_option",
   "skew_create_secondary_listing",
   "skew_buy_secondary_listing",
   "skew_transfer_option",
@@ -238,7 +233,7 @@ export const SKEW_TOOLS: Tool[] = [
   {
     name: "skew_create_option_from_rfq_quote",
     description:
-      "Issuer/MM execution bridge for USDC Auction RFQs: read the current best firm quote, verify the configured wallet is that best-quote maker, then create and collateralize a real pre-funded OptionAccount with the same auction terms. Supports Vanilla, Digital, CappedVanilla, and RangeAccrual. The buyer should then call skew_buy_option_from_rfq_quote with the auction and option_address so the purchase is bound to the firm quote. This is real issuance; it does not pretend finalize_rfq_auction mints an option. Inverse physical RFQs route through the Instant RFQ / atomic-fill lane.",
+      "LEGACY advanced-only pre-funded bridge for USDC Auction RFQs: read the current best firm quote, verify the configured wallet is that best-quote maker, then create and collateralize a full-collateral OptionAccount with the same auction terms. This is not the official Auction PM settlement path and is hidden from trading/rfq profiles. Official cleared issuance must use skew_request_instant_rfq_from_auction -> skew_hit_instant_rfq_from_auction_quote / atomic_fill_from_relay.",
     inputSchema: {
       type: "object",
       properties: {
@@ -268,7 +263,7 @@ export const SKEW_TOOLS: Tool[] = [
   {
     name: "skew_buy_option_from_rfq_quote",
     description:
-      "Buyer-side Auction RFQ execution guard. Refetches the RFQ auction, verifies the configured wallet is the auction buyer, verifies the funded option matches the current best firm quote maker and auction terms, then calls buy_option with the exact best-quote premium. Use this instead of raw skew_buy_option for RFQ tape executions.",
+      "LEGACY advanced-only buyer purchase for the quote-bound pre-funded Auction bridge. Refetches the RFQ auction, verifies the configured wallet is the auction buyer, verifies the funded option matches the current best firm quote maker and auction terms, then calls buy_option with the exact best-quote premium. This route is full-collateral/pre-funded and is not PM-guaranteed. Official Auction execution uses skew_request_instant_rfq_from_auction -> skew_hit_instant_rfq_from_auction_quote.",
     inputSchema: {
       type: "object",
       properties: {

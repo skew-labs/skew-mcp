@@ -382,14 +382,12 @@ function agentGuideForJson() {
                 ],
             },
             auction_rfq_firm_tape: {
-                purpose: "Buyer opens an on-chain competition window and MMs post firm quotes. finalize_rfq_auction publishes/takes the tape and refunds auction escrow; it is not by itself an option mint.",
+                purpose: "Buyer opens an on-chain competition window and MMs post firm quotes. finalize_rfq_auction publishes/takes the tape and refunds auction escrow; it is not by itself an option mint. Official Auction execution is forced through the Instant RFQ PM atomic-fill handoff.",
                 buyer_tools: ["skew_register_rfq_auction", "skew_finalize_rfq_auction"],
                 maker_tools: ["skew_submit_rfq_quote_direct", "skew_submit_rfq_quote"],
                 execution_tools: [
                     "skew_request_instant_rfq_from_auction",
                     "skew_hit_instant_rfq_from_auction_quote",
-                    "skew_create_option_from_rfq_quote",
-                    "skew_buy_option_from_rfq_quote",
                 ],
             },
             secondary_tape: {
@@ -399,8 +397,14 @@ function agentGuideForJson() {
                 completion_rule: "A secondary trade is delivered only when skew_transfer_option returns readback_ok=true and the buyer appears as holder.",
             },
             pre_funded_legacy: {
-                purpose: "Simple fully collateralized issuance using create_option/buy_option. It is useful for demos and legacy primitives but does not show marginal PM capital efficiency.",
-                tools: ["skew_create_option", "skew_buy_option", "skew_settle_option"],
+                purpose: "Simple fully collateralized issuance using create_option/buy_option or the advanced-only quote-bound Auction bridge. It is useful for inventory/legacy primitives but does not show marginal PM capital efficiency.",
+                tools: [
+                    "skew_create_option",
+                    "skew_buy_option",
+                    "skew_create_option_from_rfq_quote",
+                    "skew_buy_option_from_rfq_quote",
+                    "skew_settle_option",
+                ],
             },
         },
         readback_rules: [
@@ -771,6 +775,8 @@ async function executeInstantRfqHit(args) {
     }
     const prePositions = preMakerCm?.positionsCount ?? null;
     const postPositions = postMakerCm?.positionsCount ?? null;
+    const registryUpdated = makerHasShort &&
+        (prePositions === null || postPositions === null || postPositions >= prePositions + 1);
     if (prePositions !== null &&
         postPositions !== null &&
         postPositions < prePositions + 1) {
@@ -780,11 +786,21 @@ async function executeInstantRfqHit(args) {
     const postLocked = postMakerCm?.totalPmLockedMicro ?? 0n;
     const lockedDelta = postLocked >= preLocked ? postLocked - preLocked : 0n;
     const notionalMicro = args.built.optionSpec.payoffAmountMicro;
+    const resultStatus = result;
     return {
         success: true,
         readback_ok: readbackErrors.length === 0,
         readback_errors: readbackErrors,
         execution_lane: "instant_rfq_atomic_fill",
+        trade_state: resultStatus.tradeState ?? "FILLED",
+        clearing_state: resultStatus.clearingState ?? "FILLED",
+        pm_backed: true,
+        pm_guarantee: "guaranteed",
+        registry_updated: registryUpdated,
+        rejection_reason: resultStatus.rejectionReason ?? null,
+        relay_event_id: resultStatus.relayEventId ?? null,
+        relay_sequence: resultStatus.relaySequence ?? null,
+        server_time_ms: resultStatus.serverTimeMs ?? null,
         collateral_model: "portfolio_margin_delta_im",
         origin: args.origin ?? null,
         tx_signature: result.txSignature,
@@ -1560,6 +1576,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const optionReadback = optionSummaryForJson(result.option_readback);
                 return ok(JSON.stringify({
                     success: result.success,
+                    execution_lane: "secondary_transfer",
+                    trade_state: "TRANSFER_PENDING",
+                    clearing_state: "NOT_APPLICABLE",
+                    pm_backed: false,
+                    pm_guarantee: "not_applicable",
                     listing: result.listing,
                     option_pda: result.option_pda,
                     option_token_mint: result.option_token_mint,
@@ -1595,6 +1616,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 });
                 return ok(JSON.stringify({
                     ...result,
+                    execution_lane: "secondary_transfer",
+                    trade_state: "TRANSFER_PENDING",
+                    clearing_state: "NOT_APPLICABLE",
+                    pm_backed: false,
+                    pm_guarantee: "not_applicable",
                     delivery_step: {
                         tool: "skew_transfer_option",
                         args: {
@@ -1901,6 +1927,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return ok(JSON.stringify({
                     success: true,
                     simulated,
+                    execution_lane: "prefunded_create_buy",
+                    collateral_model: "prefunded_full_collateral",
+                    pm_backed: false,
+                    pm_guarantee: "not_guaranteed",
                     option_address: result.address.toBase58(),
                     nonce: result.nonce.toString(),
                     settlement_mint: (settlementMint ?? new PublicKey(USDC_MINT)).toBase58(),
@@ -2044,6 +2074,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return ok(JSON.stringify({
                     success: true,
                     execution_lane: "auction_terms_to_instant_rfq_atomic_fill",
+                    trade_state: "RFQ_REQUESTED",
+                    clearing_state: "NOT_APPLICABLE",
+                    pm_backed: false,
+                    pm_guarantee: "not_applicable",
+                    pm_contract: "PM is guaranteed only after the selected quote is hit through atomic_fill_from_relay.",
                     collateral_model: "portfolio_margin_delta_im",
                     auction: {
                         pda: auctionPda.toBase58(),
@@ -2109,6 +2144,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return ok(JSON.stringify({
                     success: true,
                     execution_lane: "instant_rfq_atomic_fill",
+                    trade_state: "RFQ_REQUESTED",
+                    clearing_state: "NOT_APPLICABLE",
+                    pm_backed: false,
+                    pm_guarantee: "not_applicable",
+                    pm_contract: "PM is guaranteed only after the selected quote is hit through atomic_fill_from_relay.",
                     collateral_model: "portfolio_margin_delta_im",
                     relay_url: relayUrl,
                     buyer: buyer.toBase58(),
@@ -2358,6 +2398,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return ok(JSON.stringify({
                     success: true,
                     execution_lane: "instant_rfq_atomic_fill",
+                    trade_state: "FILLED",
+                    clearing_state: "FILLED",
+                    pm_backed: true,
+                    pm_guarantee: "guaranteed",
+                    registry_updated: true,
                     role: "maker_mm",
                     maker: maker.toBase58(),
                     relay_url: relayUrl,
@@ -2394,6 +2439,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return ok(JSON.stringify({
                     success: true,
                     simulated: result.simulated === true,
+                    execution_lane: "prefunded_create_buy",
+                    collateral_model: "prefunded_full_collateral",
+                    pm_backed: false,
+                    pm_guarantee: "not_guaranteed",
+                    official_auction_pm_path: false,
+                    legacy_advanced_only: true,
+                    recommended_pm_path: [
+                        "skew_request_instant_rfq_from_auction",
+                        "skew_hit_instant_rfq_from_auction_quote",
+                    ],
+                    trade_state: "TRANSFER_PENDING",
+                    clearing_state: "NOT_APPLICABLE",
                     auction: result.auction,
                     buyer: result.buyer,
                     maker: result.maker,
@@ -2453,6 +2510,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const makerPortfolio = await skew.getPortfolio(result.maker);
                 return ok(JSON.stringify({
                     success: true,
+                    execution_lane: "prefunded_create_buy",
+                    collateral_model: "prefunded_full_collateral",
+                    pm_backed: false,
+                    pm_guarantee: "not_guaranteed",
+                    official_auction_pm_path: false,
+                    legacy_advanced_only: true,
+                    recommended_pm_path: [
+                        "skew_request_instant_rfq_from_auction",
+                        "skew_hit_instant_rfq_from_auction_quote",
+                    ],
+                    trade_state: "FILLED",
+                    clearing_state: "NOT_APPLICABLE",
                     tx_signature: result.txSignature,
                     auction: result.auction,
                     option_address: result.optionAddress ?? optionAddress,
@@ -2497,6 +2566,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const result = await skew.buy(optionAddress, premiumUsd);
                 return ok(JSON.stringify({
                     success: true,
+                    execution_lane: "prefunded_create_buy",
+                    collateral_model: "prefunded_full_collateral",
+                    pm_backed: false,
+                    pm_guarantee: "not_guaranteed",
+                    trade_state: "FILLED",
+                    clearing_state: "NOT_APPLICABLE",
                     tx_signature: result.txSignature,
                     option_address: optionAddress,
                     option_token_mint: result.optionTokenMint,
@@ -3124,6 +3199,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     success: readbackOk,
                     readback_ok: readbackOk,
                     readback_errors: readbackErrors,
+                    execution_lane: "secondary_transfer",
+                    trade_state: readbackOk ? "TRANSFER_DELIVERED" : "TRANSFER_PENDING",
+                    clearing_state: "NOT_APPLICABLE",
+                    pm_backed: false,
+                    pm_guarantee: "not_applicable",
                     tx_signature: r.txSignature,
                     option_address: optionAddress,
                     old_holder: oldHolder,
@@ -3150,6 +3230,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return ok(JSON.stringify({
                     success: tracked,
                     readback_ok: tracked,
+                    trade_state: tracked ? "FILLED" : "REJECTED",
+                    clearing_state: tracked ? "FILLED" : "REJECTED",
+                    pm_backed: tracked,
+                    pm_guarantee: "conditional_registry_tracking",
                     tx_signature: r.txSignature,
                     option_address: optionAddress,
                     cm_pda: r.cmPda.toBase58(),
@@ -3179,6 +3263,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return ok(JSON.stringify({
                     success: !stillTracked,
                     readback_ok: !stillTracked,
+                    trade_state: !stillTracked ? "FILLED" : "REJECTED",
+                    clearing_state: !stillTracked ? "FILLED" : "REJECTED",
+                    pm_backed: false,
+                    pm_guarantee: "conditional_registry_tracking",
                     tx_signature: r.txSignature,
                     option_address: optionAddress,
                     positions_count_before: before?.positionsCount ?? null,
@@ -3204,6 +3292,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 ]);
                 return ok(JSON.stringify({
                     success: true,
+                    trade_state: "FILLED",
+                    clearing_state: "FILLED",
+                    pm_backed: true,
+                    pm_guarantee: "conditional_registry_tracking",
                     tx_signature: r.txSignature,
                     option_address: optionAddress,
                     writer: creator?.toBase58() ?? null,

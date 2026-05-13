@@ -6,7 +6,9 @@ Devnet launch-ready, audit-gated.
 Install the current npm release with `npx -y @skew-labs/mcp@latest`.
 The package backs the same `skew-master` Anchor
 program (123 ix · devnet `3w2qSp1UnuTbTfdHPXxm3zZaz6JZRmPpbmHf56Y1DsgK`) as
-`@skew-labs/sdk` `0.7.9+`.
+`@skew-labs/sdk` `0.7.11+`.
+
+Current package version: **0.7.21**.
 
 The server lets AI agents read market data, estimate pricing and margin, and
 inspect option, RFQ, collateral-policy, and clearing-member state through the
